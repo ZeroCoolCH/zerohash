@@ -133,6 +133,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // ADICIONAR AQUI:
+    println!("\n=== OTIMIZAÇÕES AVANÇADAS ===");
+    println!("Cache Contextual Dinâmico: ATIVADO");
+    println!("- Acelera o cálculo de hash160 usando estados intermediários de SHA-256");
+    println!("- Adapta-se automaticamente a padrões nas chaves públicas");
+    println!("- Compatível com o padrão Bitcoin 100%\n");
+
     // --- Inicialização do AppState --- 
     println!("Endereço Alvo: {}", target_address);
     println!("Hash da Chave Pública Alvo (Hash160): {}", target_pubkey_hash_hex);
