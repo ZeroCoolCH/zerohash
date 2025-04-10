@@ -24,6 +24,23 @@ O ZeroHash Finder é uma ferramenta otimizada para procurar chaves privadas Bitc
 - [Git](https://git-scm.com/) (opcional, para clonar o repositório)
 - Compilador C/C++ (para compilar dependências nativas)
 
+### Verificação de Ambiente
+
+Antes de compilar, você pode usar o script `build-check.sh` para verificar se seu ambiente está corretamente configurado e identificar problemas comuns:
+
+```bash
+# Dê permissão de execução ao script
+chmod +x build-check.sh
+
+# Execute o script
+./build-check.sh
+```
+
+O script verifica:
+- Se há um arquivo Cargo.toml conflitante no diretório principal do usuário
+- Se as dependências necessárias estão instaladas (Rust, Cargo, OpenSSL, Compilador C++)
+- E oferece orientação para resolver problemas encontrados
+
 ### Instalação no Linux
 
 1. Instale as dependências necessárias:
@@ -156,6 +173,24 @@ Se você encontrar erros relacionados ao OpenSSL durante a compilação, certifi
 Se o cargo não conseguir encontrar determinadas crates, tente atualizar o registro:
 ```bash
 cargo update
+```
+
+#### Erro de manifesto virtual com seção bin
+Se você encontrar um erro como este:
+```
+error: failed to parse manifest at `/caminho/para/Cargo.toml`
+Caused by:
+  this virtual manifest specifies a `bin` section, which is not allowed
+```
+
+Isso geralmente indica que existe um arquivo Cargo.toml conflitante fora do diretório do projeto. Verifique se há algum arquivo Cargo.toml no diretório principal do usuário ou em diretórios superiores. Para resolver:
+
+```bash
+# Verifique se existe um Cargo.toml no diretório do usuário
+ls -la ~/Cargo.toml
+
+# Se encontrar, renomeie ou mova o arquivo
+mv ~/Cargo.toml ~/Cargo.toml.bak
 ```
 
 ## Uso
