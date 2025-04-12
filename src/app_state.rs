@@ -33,7 +33,7 @@ pub struct AppState {
     pub target_address: String,
     pub target_pubkey_hash: Mutex<[u8; 20]>, // Agora mutável
     pub checked_keys: AtomicU64,
-    pub start_time: Mutex<Instant>,
+    pub start_time: Mutex<Option<Instant>>,
     pub search_active: AtomicBool,
     pub key_found: AtomicBool,
     pub found_key_hex: Mutex<Option<String>>,
@@ -53,6 +53,9 @@ pub struct AppState {
     
     // Cache de hash alvo para evitar bloqueios de mutex frequentes
     hash_target_cache: OnceCell<Arc<HashTargetCache>>,
+    
+    // --- Adicionado para modo aleatório ---
+    pub random_mode: AtomicBool,
 }
 
 impl AppState {
@@ -74,7 +77,7 @@ impl AppState {
             target_address: target_address.to_string(),
             target_pubkey_hash: Mutex::new(target_pubkey_hash),
             checked_keys: AtomicU64::new(0),
-            start_time: Mutex::new(Instant::now()),
+            start_time: Mutex::new(None),
             search_active: AtomicBool::new(false),
             key_found: AtomicBool::new(false),
             found_key_hex: Mutex::new(None),
@@ -94,6 +97,9 @@ impl AppState {
             
             // Inicialização do cache
             hash_target_cache: OnceCell::new(),
+            
+            // --- Inicializar modo aleatório como false ---
+            random_mode: AtomicBool::new(false),
         }
     }
 
@@ -143,14 +149,11 @@ impl AppState {
     }
 
     pub fn set_start_time(&self, time: Instant) {
-        *self.start_time.lock().unwrap() = time;
+        *self.start_time.lock().unwrap() = Some(time);
     }
 
     pub fn get_elapsed_time(&self) -> Option<std::time::Duration> {
-        match self.start_time.lock() {
-            Ok(start_time_guard) => Some(start_time_guard.elapsed()),
-            Err(_) => None,
-        }
+        self.start_time.lock().unwrap().map(|start| start.elapsed())
     }
     
     // Inicializa o cache de hash alvo
@@ -183,7 +186,8 @@ impl AppState {
         num_threads: usize, 
         resume: bool,
         progress_file: &str,
-        zero_prefix_length: usize
+        zero_prefix_length: usize,
+        random_mode: bool,
     ) {
         *self.range_start.lock().unwrap() = range_start;
         *self.range_end.lock().unwrap() = range_end;
@@ -198,6 +202,9 @@ impl AppState {
             // Se o cache já foi inicializado, precisamos recriá-lo na próxima vez
             // Nada a fazer aqui, só na próxima chamada a cache será recriado
         }
+        
+        // --- Armazenar modo aleatório ---
+        self.random_mode.store(random_mode, Ordering::Relaxed);
     }
     
     // Verificar se um hash corresponde ao padrão procurado (zeros no início ou hash específico)
@@ -254,10 +261,83 @@ impl AppState {
         }
     }
     
-    // Retorna o hash alvo para uso direto
+    // Renomeado para corresponder ao erro de compilação
     pub fn get_target_hash(&self) -> [u8; 20] {
-        // Garantir que o cache está inicializado
-        let cache = self.initialize_hash_target_cache();
-        cache.hash
+        *self.target_pubkey_hash.lock().unwrap()
     }
+    // Adicionar alias para manter compatibilidade onde era chamado get_target_hash160
+    pub fn get_target_hash160(&self) -> [u8; 20] {
+        self.get_target_hash()
+    }
+
+    // ... is_search_active() ...
+
+    // ... was_key_found() ...
+
+    // ... get_keys_processed() ...
+
+    // ... get_hashes_calculated() ...
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_progress_file(&self) -> String {
+        self.progress_file.lock().unwrap().clone()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_progress_file_path
+     pub fn get_progress_file_path(&self) -> String {
+         self.get_progress_file()
+     }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_results_file(&self) -> String {
+        self.results_file.lock().unwrap().clone()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_results_file_path
+    pub fn get_results_file_path(&self) -> String {
+         self.get_results_file()
+     }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_network_config(&self) -> Network {
+        *self.network.lock().unwrap()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_network
+    pub fn get_network(&self) -> Network {
+         self.get_network_config()
+     }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_start_range(&self) -> u128 {
+        *self.range_start.lock().unwrap()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_range_start
+    pub fn get_range_start(&self) -> u128 {
+        self.get_start_range()
+    }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_end_range(&self) -> u128 {
+        *self.range_end.lock().unwrap()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_range_end
+     pub fn get_range_end(&self) -> u128 {
+        self.get_end_range()
+     }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_thread_count(&self) -> usize {
+        *self.num_threads.lock().unwrap()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado get_num_threads
+     pub fn get_num_threads(&self) -> usize {
+        self.get_thread_count()
+     }
+
+    // Renomeado para corresponder ao erro de compilação
+    pub fn get_resume_flag(&self) -> bool {
+        *self.resume.lock().unwrap()
+    }
+    // Adicionar alias para manter compatibilidade onde era chamado should_resume
+    pub fn should_resume(&self) -> bool {
+         self.get_resume_flag()
+     }
 } 

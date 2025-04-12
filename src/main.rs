@@ -156,7 +156,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         actual_num_threads,
         resumed,
         PROGRESS_FILE,
-        1 // Zero prefix length padrão
+        1, // Zero prefix length padrão
+        cli.random // <-- Passar a flag random aqui
     );
     
     // Atualizar o hash160 do target
