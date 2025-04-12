@@ -38,6 +38,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // --- Parsear Argumentos CLI --- 
     let cli = Cli::parse();
 
+    // --- Imprimir Banner ---
+    println!("=============================");
+    println!("       Zerohash v{}", env!("CARGO_PKG_VERSION"));
+    println!("      By ZeroCoolCH");
+    println!("=============================\n");
+
     // --- Validar e Processar Argumentos --- 
     let target_address = &cli.address;
     let range_start_hex_cli = &cli.range_start;
