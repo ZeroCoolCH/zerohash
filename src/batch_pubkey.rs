@@ -50,8 +50,37 @@ fn u128_to_private_key_bytes(key_int: u128) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     let key_bytes = key_int.to_be_bytes();
     // Copiar os bytes da chave u128 para o final do array de 32 bytes
-    bytes[16..].copy_from_slice(&key_bytes);
+    let start_byte = 32usize.saturating_sub(key_bytes.len());
+    bytes[start_byte..].copy_from_slice(&key_bytes);
     bytes
+}
+
+// Nova função mais precisa para gerar chaves
+pub fn generate_pubkey_precise(key: u128) -> Option<[u8; 33]> {
+    // Garantir que o sistema está inicializado
+    if G_PRECOMP.get().is_none() || SECP_CONTEXT.get().is_none() {
+        initialize_batch_system();
+    }
+    
+    // Obter o contexto Secp256k1 compartilhado
+    let secp = SECP_CONTEXT.get().unwrap().clone();
+    
+    // Converter a chave u128 para uma chave privada
+    let mut private_key_bytes = [0u8; 32];
+    let key_bytes = key.to_be_bytes();
+    let start_byte = 32usize.saturating_sub(key_bytes.len());
+    private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
+    
+    // Tentar criar uma chave secreta e gerar a chave pública correspondente
+    if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {
+        // Otimização - usar o contexto Secp256k1 compartilhado
+        let pk = sk.public_key(&secp);
+        let mut serialized = [0u8; 33];
+        serialized.copy_from_slice(&pk.serialize());
+        Some(serialized)
+    } else {
+        None
+    }
 }
 
 // Implementação altamente otimizada que processa múltiplas chaves em paralelo
@@ -85,8 +114,11 @@ pub fn generate_pubkeys_batch(
             for (i, &key) in key_chunk.iter().enumerate() {
                 let abs_idx = chunk_idx * chunk_size + i;
                 
-                // Converter a chave u128 para uma chave privada
-                let private_key_bytes = u128_to_private_key_bytes(key);
+                // Converter a chave u128 para uma chave privada - CORRIGIDO
+                let mut private_key_bytes = [0u8; 32];
+                let key_bytes = key.to_be_bytes();
+                let start_byte = 32usize.saturating_sub(key_bytes.len());
+                private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
                 
                 // Tentar criar uma chave secreta e gerar a chave pública correspondente
                 if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {

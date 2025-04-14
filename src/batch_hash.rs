@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
+use hex;
 
 // Declarações de funções externas em C
 extern "C" {

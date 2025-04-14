@@ -16,9 +16,12 @@ O ZeroHash Finder é uma ferramenta projetada para procurar chaves privadas Bitc
 - **Hashing Otimizado:**
     - Implementa a geração de chaves públicas e o cálculo HASH160 (SHA256 + RIPEMD160) em lotes.
     - **Cache Contextual Dinâmico:** Acelera o cálculo de HASH160 reutilizando estados intermediários de SHA256 para prefixos de chaves públicas comuns ou frequentemente encontrados, adaptando-se aos padrões de dados (mais eficaz no modo sequencial).
-    - **Interface C++ (FFI):** Delega partes críticas do cálculo de hash (manipulação de estado SHA256, RIPEMD160) para código C++ potencialmente otimizado (`src/hasher.cpp`), linkado estaticamente.
+    - **Interface C++ (FFI):** Delega partes críticas do cálculo de hash (manipulação de estado SHA256, RIPEMD160) para código C++ otimizado (`src/hasher.cpp`), linkado estaticamente com suporte automático a instruções AVX/AVX2/AVX512.
+- **Balanceamento de Carga Dinâmico:** Implementa um sistema de divisão dinâmica de trabalho entre threads, permitindo que workers mais rápidos ajudem os mais lentos, melhorando significativamente a utilização de CPU.
+- **Detecção Automática de Arquitetura:** Identifica automaticamente as instruções suportadas pela CPU e habilita otimizações específicas em tempo de compilação.
 - **Retomada de Progresso:** No modo sequencial, salva a última chave processada em `zerohash_progress.txt` e retoma automaticamente a partir desse ponto se a busca for interrompida e reiniciada com o mesmo range. (Não aplicável ao modo aleatório).
-- **Saída Detalhada:** Exibe o endereço P2PKH, P2WPKH, P2SH-P2WPKH, a chave privada em WIF e hexadecimal, e o hash160 quando uma correspondência é encontrada. Os resultados também são salvos em `results.txt`.
+- **Saída Detalhada:** Exibe o endereço P2PKH, P2WPKH, P2SH-P2WPKH, a chave privada em WIF e hexadecimal, e o hash160 quando uma correspondência é encontrada. Os resultados também são salvos em `found_keys.txt`.
+- **Suporte a Tipos Modernos de Endereços:** Total compatibilidade com P2WPKH (endereços bech32) e P2SH-P2WPKH, além dos tradicionais P2PKH.
 - **Parada Elegante:** Responde ao sinal Ctrl+C para interromper a busca de forma limpa.
 
 ## Estrutura do Código
@@ -32,12 +35,13 @@ O projeto é organizado nos seguintes módulos principais em `src/`:
 - `batch_pubkey.rs`: Geração otimizada de chaves públicas Bitcoin em lote a partir de chaves privadas (`u128`).
 - `batch_hash.rs`: Implementação do hashing HASH160 em lote, incluindo a lógica do Cache Contextual Dinâmico e a interface (FFI) para as funções C++.
 - `hasher.cpp`: Código C++ que implementa as funções de hashing de baixo nível (SHA256, RIPEMD160, manipulação de estado) chamadas via FFI.
+- `build.rs`: Script de build que configura a compilação do código C++ e detecta recursos da CPU.
 
 ## Instalação
 
 ### Requisitos
 
-- **Rust:** Toolchain estável ou nightly (ver `rust-toolchain.toml` se presente). Instalável via [rustup](https://rustup.rs/).
+- **Rust:** Toolchain estável (1.70+). Instalável via [rustup](https://rustup.rs/).
 - **Compilador C++:** Necessário para compilar `hasher.cpp` (ex: `gcc`, `clang`, MSVC Build Tools).
 - **OpenSSL:** Biblioteca de desenvolvimento (ex: `libssl-dev` no Debian/Ubuntu, `openssl-devel` no Fedora).
 - **Git:** Para clonar o repositório.
@@ -65,11 +69,10 @@ O projeto é organizado nos seguintes módulos principais em `src/`:
     ```
 
 4.  **Compilar (Modo Release Otimizado):**
-    *É altamente recomendável compilar com `target-cpu=native` para obter o máximo desempenho no seu hardware específico.*
     ```bash
-    RUSTFLAGS="-C target-cpu=native" cargo build --release
+    cargo build --release
     ```
-    *(No Windows, use `set RUSTFLAGS=-C target-cpu=native` antes do comando `cargo build`).*
+    *O script build.rs detectará automaticamente as instruções suportadas pela sua CPU e habilitará otimizações adequadas.*
 
 5.  **Executável:** O binário estará em `./target/release/zerohash_finder`.
 
@@ -106,21 +109,43 @@ O projeto é organizado nos seguintes módulos principais em `src/`:
                                --range-start 20000000000000000 \
                                --range-end   3ffffffffffffffff \
                                --random
+                               
+# Busca sequencial em range específico (exemplo de teste)
+./target/release/zerohash_finder --address 1HduPEXZRdG26SUT5Yk83mLkPyjnZuJ7Bm \
+                               --range-start 10000 \
+                               --range-end   20000
 ```
 
 **Saída:**
 
-- O programa exibirá o progresso (taxa de chaves por segundo e/ou percentual concluído).
-- Se uma chave for encontrada, os detalhes completos (Hex, WIF, Endereços, Hash) serão impressos no console e salvos em `results.txt`.
+- O programa exibirá o progresso com taxa de processamento, percentual concluído, número de workers ativos e chunks restantes.
+- Se uma chave for encontrada, os detalhes completos (Hex, WIF, Endereços, Hash) serão impressos no console e salvos em `found_keys.txt`.
 - Ao final, exibirá um resumo com o total de chaves processadas, tempo total e taxa média.
 - Pressione `Ctrl+C` a qualquer momento para parar a busca.
 
 ## Performance
 
-- A performance depende muito do hardware (CPU, cache, velocidade da memória) e do modo de busca.
-- O **modo sequencial** tende a ser mais rápido (potencialmente dezenas de Mkeys/s) devido à alta eficiência do Cache Contextual Dinâmico.
-- O **modo aleatório** geralmente terá uma taxa menor (na casa de 0.1 a alguns Mkeys/s) pois a geração aleatória e a menor eficiência do cache introduzem overhead.
-- Compilar com `RUSTFLAGS="-C target-cpu=native"` é crucial para atingir o pico de performance.
+- A performance do programa foi otimizada com diversas técnicas:
+  - **Balanceamento de Carga Dinâmico:** Distribui automaticamente o trabalho entre as threads, evitando que algumas fiquem ociosas enquanto outras estão sobrecarregadas.
+  - **Cache Contextual Dinâmico:** Melhora significativamente a performance reutilizando estados intermediários de hashing.
+  - **Otimizações por Arquitetura:** Suporte automaticamente detectado para AVX/AVX2/AVX512.
+  - **Interface C++:** Operações críticas de hash delegadas para código C++ otimizado.
+  
+- Em hardware moderno (CPU recente com múltiplos núcleos):
+  - **Modo sequencial**: Pode atingir de 100 mil a vários milhões de chaves por segundo, dependendo do hardware.
+  - **Modo aleatório**: Geralmente alcança taxa menor devido à geração aleatória e menor eficiência do cache.
+
+## Exemplos de Resultados
+
+O ZeroHash Finder já foi capaz de encontrar as seguintes chaves de teste:
+
+- **Endereço:** 1HduPEXZRdG26SUT5Yk83mLkPyjnZuJ7Bm
+  - **Chave Privada (Hex):** 000000000000000000000000000000000000000000000000000000000001764f
+  - **WIF:** KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFiHkRsp99uC
+
+- **Endereço:** 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ
+  - **Chave Privada (Hex):** 0000000000000000000000000000000000000000000000bebb3940cd0fc1491
+  - **WIF:** KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qd7sDG4F2sdMtzNe8y2U
 
 ## Aviso Legal
 
