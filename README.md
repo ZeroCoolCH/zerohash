@@ -19,7 +19,7 @@ O ZeroHash Finder é uma ferramenta projetada para procurar chaves privadas Bitc
     - **Interface C++ (FFI):** Delega partes críticas do cálculo de hash (manipulação de estado SHA256, RIPEMD160) para código C++ otimizado (`src/hasher.cpp`), linkado estaticamente com suporte automático a instruções AVX/AVX2/AVX512.
 - **Balanceamento de Carga Dinâmico:** Implementa um sistema de divisão dinâmica de trabalho entre threads, permitindo que workers mais rápidos ajudem os mais lentos, melhorando significativamente a utilização de CPU.
 - **Detecção Automática de Arquitetura:** Identifica automaticamente as instruções suportadas pela CPU e habilita otimizações específicas em tempo de compilação.
-- **Retomada de Progresso:** No modo sequencial, salva a última chave processada em `zerohash_progress.txt` e retoma automaticamente a partir desse ponto se a busca for interrompida e reiniciada com o mesmo range. (Não aplicável ao modo aleatório).
+- **Retomada de Progresso:** No modo sequencial, salva a última chave processada a cada 5 segundos em `zerohash_progress.txt` e retoma automaticamente a partir desse ponto seguinte se a busca for interrompida e reiniciada com o mesmo range. O sistema verifica automaticamente se o arquivo existe e usa seu conteúdo para recomeçar do ponto onde parou. (Não aplicável ao modo aleatório, que inicia sempre do começo).
 - **Saída Detalhada:** Exibe o endereço P2PKH, P2WPKH, P2SH-P2WPKH, a chave privada em WIF e hexadecimal, e o hash160 quando uma correspondência é encontrada. Os resultados também são salvos em `found_keys.txt`.
 - **Suporte a Tipos Modernos de Endereços:** Total compatibilidade com P2WPKH (endereços bech32) e P2SH-P2WPKH, além dos tradicionais P2PKH.
 - **Parada Elegante:** Responde ao sinal Ctrl+C para interromper a busca de forma limpa.
@@ -93,7 +93,23 @@ O projeto é organizado nos seguintes módulos principais em `src/`:
 **Opções:**
 
 - `--random`: Ativa o modo de busca aleatória dentro do range especificado. Sem esta flag, a busca é sequencial.
+  - No modo aleatório, o arquivo de progresso é desativado, e cada execução começa do zero.
+  - Modo ideal para explorar ranges grandes de forma probabilística.
 - `--threads <NUMERO>`: Define o número de threads a serem usadas. Se omitido ou 0, usa todos os núcleos lógicos disponíveis.
+
+**Modos de Execução:**
+
+- **Modo Sequencial (padrão)**: 
+  - Examina cada chave do range de forma ordenada e completa
+  - Salva o progresso periodicamente em `zerohash_progress.txt`
+  - Retoma automaticamente do último ponto salvo se reiniciado
+  - Ideal para ranges pequenos ou médios que precisam ser verificados completamente
+  
+- **Modo Aleatório** (com flag `--random`):
+  - Seleciona chaves aleatoriamente dentro do range especificado
+  - Não salva progresso (cada execução é independente)
+  - Ideal para explorar grandes espaços de busca onde verificação completa seria inviável
+  - Útil para demonstrações ou para testar a sorte
 
 **Exemplos:**
 
@@ -122,6 +138,34 @@ O projeto é organizado nos seguintes módulos principais em `src/`:
 - Se uma chave for encontrada, os detalhes completos (Hex, WIF, Endereços, Hash) serão impressos no console e salvos em `found_keys.txt`.
 - Ao final, exibirá um resumo com o total de chaves processadas, tempo total e taxa média.
 - Pressione `Ctrl+C` a qualquer momento para parar a busca.
+
+## Dicas e Solução de Problemas
+
+### Sistema de Progresso
+
+- **Arquivo de Progresso**: O programa salva o progresso a cada 5 segundos no arquivo `zerohash_progress.txt` no diretório de execução.
+- **Formato**: O arquivo contém um único valor hexadecimal sem prefixo, representando a última chave processada.
+- **Reinício**: Quando você reinicia o programa com o mesmo intervalo, ele verifica automaticamente o arquivo de progresso e continua de onde parou.
+- **Tempo Mínimo de Execução**: O programa precisa executar por pelo menos 5-10 segundos para que o progresso seja salvo.
+- **Verificação do Progresso**: Você pode verificar o progresso atual usando: `cat zerohash_progress.txt`
+- **Modo Aleatório**: No modo aleatório (`--random`), o sistema de progresso é desativado intencionalmente.
+
+### Outras Dicas
+
+- **Performance Ótima**:
+  - Use o modo Release: `cargo run --release -- [ARGUMENTOS]` ou o binário compilado em release
+  - Em CPUs modernas, um valor adequado para `--threads` é geralmente o número de núcleos físicos + 1
+  
+- **Testes**:
+  - Para testar se o sistema está funcionando corretamente, use um range pequeno com um endereço de teste conhecido como:
+    ```
+    --address 1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ --range-start bebb3940cd0fc1000 --range-end bebb3940cd0fc5000
+    ```
+
+- **Problemas Comuns**:
+  - **Arquivo de progresso não é criado**: Certifique-se de que o programa executa por pelo menos 5-10 segundos
+  - **Performance baixa**: Verifique se está executando a build de release e não a de debug
+  - **Erros de permissão**: Certifique-se de que você tem permissões de escrita no diretório atual
 
 ## Performance
 
