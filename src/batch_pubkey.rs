@@ -1,8 +1,7 @@
 // batch_pubkey.rs - Implementação de geração de chaves públicas em batch ultra-otimizada
-use bitcoin::{secp256k1::{self, Secp256k1, PublicKey, SecretKey}};
+use bitcoin::{secp256k1::{self, Secp256k1, SecretKey}};
 use std::sync::Arc;
 use rayon::prelude::*;
-use std::arch::x86_64::*;
 use once_cell::sync::OnceCell;
 
 // Constantes de ponto gerador G pré-computado e otimizado para cálculos rápidos de EC

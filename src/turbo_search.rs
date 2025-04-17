@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering, AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 use rand::{Rng, rng};
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufRead, BufReader, BufWriter};
+use std::io::{Write, BufRead, BufReader, BufWriter, Read};
 use crossbeam::thread;
 use rayon::prelude::*;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -25,8 +25,10 @@ use bitcoin::{Address};
 use bitcoin::hashes::{sha256};
 use bs58;
 use std::sync::Mutex;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use sha3;
+use serde::{Serialize, Deserialize};
+use std::path::Path;
 
 const MEGA_BATCH_SIZE: usize = 65536;  // Reduzido de 1M para 64K
 const SUB_BATCH_SIZE: usize = 32768;   // Reduzido de 128K para 32K
@@ -36,6 +38,23 @@ const DYNAMIC_CHUNK_SIZE: usize = 262144; // Reduzido drasticamente de 10M para 
 
 // Definir constante para o arquivo de progresso
 pub const PROGRESS_FILE: &str = "zerohash_progress.txt";
+pub const JSON_PROGRESS_FILE: &str = "zerohash_progress.json";
+
+// Estrutura para armazenar informações de progresso para um endereço e range específicos
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProgressEntry {
+    pub address: String,
+    pub range_start: String,  // Valor hex do início do range
+    pub range_end: String,    // Valor hex do fim do range
+    pub current_key: String,  // Valor hex da última chave processada
+    pub timestamp: u64,       // Timestamp da última atualização
+}
+
+// Estrutura completa para armazenar todos os progressos
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct ProgressData {
+    pub entries: Vec<ProgressEntry>,
+}
 
 // Estrutura que representa um lote de chaves privadas para processamento
 struct KeyBatch {
@@ -63,7 +82,108 @@ struct WorkRange {
     end: u128,
 }
 
-/// Helper para salvar o progresso em um arquivo.
+/// Helper para salvar o progresso em um arquivo JSON.
+fn save_progress_json(address: &str, range_start: u128, range_end: u128, current_key: u128) -> Result<(), String> {
+    println!("Salvando progresso em JSON '{}': endereço {}, range {:x}-{:x}, valor atual {:x}", 
+             JSON_PROGRESS_FILE, address, range_start, range_end, current_key);
+    
+    // Carregar dados existentes ou criar estrutura vazia
+    let mut progress_data = load_progress_data().unwrap_or_default();
+    
+    // Verificar se já existe entrada para este endereço e range
+    let range_start_hex = format!("{:x}", range_start);
+    let range_end_hex = format!("{:x}", range_end);
+    let current_key_hex = format!("{:x}", current_key);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    
+    let entry_index = progress_data.entries.iter().position(|entry| 
+        entry.address == address && 
+        entry.range_start == range_start_hex && 
+        entry.range_end == range_end_hex
+    );
+    
+    if let Some(index) = entry_index {
+        // Atualizar entrada existente
+        progress_data.entries[index].current_key = current_key_hex;
+        progress_data.entries[index].timestamp = timestamp;
+    } else {
+        // Adicionar nova entrada
+        progress_data.entries.push(ProgressEntry {
+            address: address.to_string(),
+            range_start: range_start_hex,
+            range_end: range_end_hex,
+            current_key: current_key_hex,
+            timestamp,
+        });
+    }
+    
+    // Salvar arquivo JSON
+    match File::create(JSON_PROGRESS_FILE) {
+        Ok(file) => {
+            match serde_json::to_writer_pretty(file, &progress_data) {
+                Ok(_) => {
+                    println!("✓ Progresso JSON salvo com sucesso para endereço {} e range {:x}-{:x}", 
+                             address, range_start, range_end);
+                    Ok(())
+                },
+                Err(e) => Err(format!("Falha ao serializar JSON: {}", e))
+            }
+        },
+        Err(e) => Err(format!("Falha ao criar arquivo JSON: {}", e))
+    }
+}
+
+/// Carrega todos os dados de progresso do arquivo JSON
+pub fn load_progress_data() -> Result<ProgressData, String> {
+    if !Path::new(JSON_PROGRESS_FILE).exists() {
+        return Ok(ProgressData::default());
+    }
+    
+    match File::open(JSON_PROGRESS_FILE) {
+        Ok(file) => {
+            match serde_json::from_reader(file) {
+                Ok(data) => Ok(data),
+                Err(e) => Err(format!("Falha ao desserializar JSON: {}", e))
+            }
+        },
+        Err(e) => Err(format!("Falha ao abrir arquivo JSON: {}", e))
+    }
+}
+
+/// Carrega o progresso específico para um endereço e range
+pub fn load_specific_progress(address: &str, range_start: u128, range_end: u128) -> Result<u128, String> {
+    let range_start_hex = format!("{:x}", range_start);
+    let range_end_hex = format!("{:x}", range_end);
+    
+    match load_progress_data() {
+        Ok(data) => {
+            for entry in data.entries {
+                if entry.address == address && 
+                   entry.range_start == range_start_hex && 
+                   entry.range_end == range_end_hex {
+                    
+                    match u128::from_str_radix(&entry.current_key, 16) {
+                        Ok(value) => {
+                            println!("✓ Progresso JSON carregado com sucesso para endereço {} e range {:x}-{:x}: valor atual {:x}",
+                                    address, range_start, range_end, value);
+                            return Ok(value);
+                        },
+                        Err(e) => return Err(format!("Falha ao converter valor hexadecimal: {}", e))
+                    }
+                }
+            }
+            
+            Err(format!("Nenhum progresso encontrado para endereço {} e range {:x}-{:x}", 
+                       address, range_start, range_end))
+        },
+        Err(e) => Err(e)
+    }
+}
+
+/// Helper para salvar o progresso em um arquivo (para compatibilidade).
 fn save_progress_helper(progress_path: &str, current_key: u128) -> Result<(), String> {
     println!("Salvando progresso em '{}': valor atual {:x} ({})", progress_path, current_key, current_key);
     match File::create(progress_path) {
@@ -85,7 +205,7 @@ fn save_progress_helper(progress_path: &str, current_key: u128) -> Result<(), St
     }
 }
 
-/// Carrega o progresso anterior de um arquivo.
+/// Carrega o progresso anterior de um arquivo (para compatibilidade).
 pub fn load_progress(progress_path: &str) -> Result<u128, String> {
     match File::open(progress_path) {
         Ok(file) => {
@@ -139,12 +259,33 @@ pub fn load_progress(progress_path: &str) -> Result<u128, String> {
     }
 }
 
-/// Salva o progresso atual da busca em um arquivo.
+/// Salva o progresso atual da busca em um arquivo (para compatibilidade e no novo formato JSON).
 pub fn save_progress(progress_path: &str, current_key: u128) -> std::io::Result<()> {
+    // Salvar no formato antigo para compatibilidade
     let mut file = File::create(progress_path)?;
-    // Converter para hexadecimal e salvar, igual à função save_progress_helper
     let hex_string = format!("{:x}", current_key);
     write!(file, "{}", hex_string)?;
+    
+    // Se o AppState estiver disponível, salvar também no formato JSON
+    if let Some(app_state) = crate::app_state::get_current_app_state() {
+        let range_start = match app_state.range_start.lock() {
+            Ok(guard) => *guard,
+            Err(_) => 0,
+        };
+        
+        let range_end = match app_state.range_end.lock() {
+            Ok(guard) => *guard,
+            Err(_) => u128::MAX,
+        };
+        
+        let _ = save_progress_json(
+            &app_state.target_address,
+            range_start,
+            range_end,
+            current_key
+        );
+    }
+    
     Ok(())
 }
 
@@ -231,6 +372,18 @@ fn initialize_contextual_cache() {
 pub fn turbo_search(app_state: Arc<AppState>) {
     // Aquecer o sistema antes de iniciar a busca
     warmup_system();
+    
+    // Salvar progresso JSON inicial
+    println!("Salvando progresso JSON inicial...");
+    match save_progress_json(
+        &app_state.target_address,
+        app_state.get_range_start(),
+        app_state.get_range_end(),
+        app_state.get_range_start()
+    ) {
+        Ok(_) => println!("✓ Progresso JSON inicial salvo com sucesso."),
+        Err(e) => println!("! Erro ao salvar progresso JSON inicial: {}", e)
+    }
     
     // Inicializar o Cache Contextual Dinâmico
     initialize_contextual_cache();
@@ -938,6 +1091,14 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                                                     Ok(_) => println!("✓ Progresso salvo em '{}': {:x}", progress_file, key_to_save),
                                                     Err(e) => eprintln!("Erro ao salvar progresso: {}", e)
                                                 }
+                                                
+                                                // Salvar versão JSON do progresso também
+                                                let _ = save_progress_json(
+                                                    &process_app_state.target_address,
+                                                    process_app_state.get_range_start(),
+                                                    process_app_state.get_range_end(),
+                                                    key_to_save
+                                                );
                                             }
                                         }
                                     }

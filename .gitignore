@@ -3,6 +3,7 @@
 
 # Arquivos de progresso e resultados
 zerohash_progress.txt
+zerohash_progress.json
 found_keys.txt
 
 # Arquivos de perfil

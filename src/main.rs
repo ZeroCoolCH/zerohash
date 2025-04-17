@@ -8,7 +8,7 @@ mod turbo_search;
 // Usar tipos/funções dos módulos
 use crate::app_state::AppState;
 use crate::cli::Cli;
-use crate::turbo_search::turbo_search;
+use crate::turbo_search::{turbo_search, PROGRESS_FILE, JSON_PROGRESS_FILE, load_specific_progress};
 
 use clap::Parser;
 use std::{error::Error, sync::Arc, time::Instant};
@@ -16,14 +16,12 @@ use bs58;
 use hex;
 use rayon;
 
-// Referenciar constante do turbo_search
-use crate::turbo_search::PROGRESS_FILE;
-
 // Adicionar imports necessários
 use std::sync::atomic::Ordering;
 use ctrlc;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
+use std::path::Path;
 
 #[link(name = "hasher", kind = "static")]
 extern "C" {
@@ -69,11 +67,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
         std::process::exit(1);
     }
-    let target_pubkey_hash: [u8; 20] = decoded_data[1..21]
+    
+    // Obter o hash160 original do endereço
+    let original_target_pubkey_hash: [u8; 20] = decoded_data[1..21]
         .try_into()
         .expect("Slice len garantido por check anterior");
-    let target_pubkey_hash_hex = hex::encode(target_pubkey_hash);
-
+    let target_pubkey_hash_hex = hex::encode(&original_target_pubkey_hash);
+    
     // Parsear ranges como u128
     let range_start_cli = u128::from_str_radix(range_start_hex_cli, 16)
         .map_err(|e| format!("Falha ao parsear início do range hexadecimal da CLI: {}", e))?;
@@ -84,28 +84,71 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut range_start = range_start_cli;
     let mut resumed = false;
     if !cli.random { // Só carregar/salvar progresso se NÃO for modo random
-        if let Ok(file) = File::open(PROGRESS_FILE) {
+        // Verificar primeiro pelo arquivo JSON
+        if Path::new(JSON_PROGRESS_FILE).exists() {
+            println!("Verificando progresso específico para endereço {} e range {:x}-{:x} no arquivo JSON...", 
+                     target_address, range_start_cli, range_end);
+            
+            match load_specific_progress(target_address, range_start_cli, range_end) {
+                Ok(last_key_saved) => {
+                    if last_key_saved >= range_start_cli && last_key_saved < range_end {
+                        println!("Progresso JSON encontrado. Retomando de: {:x}", last_key_saved + 1);
+                        range_start = last_key_saved + 1;
+                        resumed = true;
+                    } else {
+                        println!("Progresso JSON ({:x}) inválido/fora do range. Ignorando.", last_key_saved);
+                    }
+                },
+                Err(e) => {
+                    println!("Não foi possível carregar progresso JSON específico: {}", e);
+                    
+                    // Tentar o arquivo de progresso antigo como fallback
+                    if let Ok(file) = File::open(PROGRESS_FILE) {
+                        let reader = BufReader::new(file);
+                        if let Some(Ok(line)) = reader.lines().next() {
+                            if let Ok(last_key_saved) = u128::from_str_radix(&line.trim(), 16) {
+                                if last_key_saved >= range_start_cli && last_key_saved < range_end {
+                                    println!("Progresso legado encontrado. Retomando de: {:x}", last_key_saved + 1);
+                                    range_start = last_key_saved + 1;
+                                    resumed = true;
+                                } else {
+                                    println!("Progresso legado ({:x}) inválido/fora do range. Ignorando.", last_key_saved);
+                                }
+                            } else {
+                                println!("Erro ao parsear progresso legado, ignorando.");
+                            }
+                        } else {
+                            println!("Arquivo de progresso legado vazio/ilegível, ignorando.");
+                        }
+                    } else {
+                        println!("Nenhum progresso legado encontrado.");
+                    }
+                }
+            }
+        } else if let Ok(file) = File::open(PROGRESS_FILE) {
+            // Arquivo JSON não existe, verificar o arquivo de progresso antigo
+            println!("Arquivo de progresso JSON não encontrado, verificando progresso legado...");
             let reader = BufReader::new(file);
             if let Some(Ok(line)) = reader.lines().next() {
                 if let Ok(last_key_saved) = u128::from_str_radix(&line.trim(), 16) {
                     if last_key_saved >= range_start_cli && last_key_saved < range_end {
-                        println!("Progresso sequencial encontrado. Retomando de: {:x}", last_key_saved + 1);
+                        println!("Progresso legado encontrado. Retomando de: {:x}", last_key_saved + 1);
                         range_start = last_key_saved + 1;
                         resumed = true;
                     } else {
-                        println!("Progresso sequencial ({:x}) inválido/fora do range. Ignorando.", last_key_saved);
+                        println!("Progresso legado ({:x}) inválido/fora do range. Ignorando.", last_key_saved);
                     }
                 } else {
-                     println!("Erro ao parsear progresso sequencial, ignorando.");
+                     println!("Erro ao parsear progresso legado, ignorando.");
                 }
             } else {
-                 println!("Arquivo de progresso vazio/ilegível, ignorando.");
+                 println!("Arquivo de progresso legado vazio/ilegível, ignorando.");
             }
         } else {
-            println!("Nenhum progresso sequencial encontrado.");
+            println!("Nenhum arquivo de progresso encontrado.");
         }
     } else {
-        println!("Modo Aleatório Ativado: Progresso sequencial será ignorado e não será salvo.");
+        println!("Modo Aleatório Ativado: Progresso será ignorado e não será salvo.");
         // Garantir que range_start é o da CLI no modo aleatório
         range_start = range_start_cli;
         resumed = false; // Nunca retoma no modo aleatório
@@ -144,7 +187,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Cache Contextual Dinâmico: ATIVADO");
     println!("- Acelera o cálculo de hash160 usando estados intermediários de SHA-256");
     println!("- Adapta-se automaticamente a padrões nas chaves públicas");
-    println!("- Compatível com o padrão Bitcoin 100%\n");
+    println!("- Compatível com o padrão Bitcoin 100%");
+    println!("\n=== RECURSOS ===");
+    println!("Gerenciamento de Progresso JSON: ATIVADO");
+    println!("- Salva progresso específico para cada combinação de endereço e range");
+    println!("- Permite retomar buscas interrompidas com precisão\n");
 
     // --- Inicialização do AppState --- 
     println!("Endereço Alvo: {}", target_address);
@@ -169,7 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Atualizar o hash160 do target
     {
         let mut target_hash = app_state.target_pubkey_hash.lock().unwrap();
-        target_hash.copy_from_slice(&target_pubkey_hash);
+        target_hash.copy_from_slice(&original_target_pubkey_hash);
     }
     
     // --- Configurar Handler Ctrl+C --- 
@@ -179,11 +226,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         app_state_clone_for_ctrlc.search_active.store(false, Ordering::SeqCst);
     }).expect("Erro ao configurar o handler Ctrl+C");
 
+    // Configurar a instância atual do AppState para acesso global
+    AppState::set_as_current(app_state.clone());
+
     // --- Iniciar busca com o modo turbo ---
-    println!("=== INICIANDO BUSCA DE ALTA PERFORMANCE ===");
     app_state.search_active.store(true, Ordering::SeqCst);
     app_state.set_start_time(Instant::now());
-    
+
     // Iniciar busca de alta performance
     turbo_search(app_state.clone());
     

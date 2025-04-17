@@ -7,6 +7,9 @@ use std::io::Write;
 use bitcoin::Network;
 use once_cell::sync::OnceCell;
 
+// Variável estática para armazenar a última instância do AppState
+static CURRENT_APP_STATE: Mutex<Option<Arc<AppState>>> = Mutex::new(None);
+
 // Configuração para o tipo de endereço Bitcoin
 pub struct AddressConfig {
     pub zero_count: usize,
@@ -198,42 +201,85 @@ impl AppState {
         
         // Em vez de tentar modificar o cache diretamente, vamos apenas marcá-lo como inválido
         // forçando a recriação na próxima chamada a initialize_hash_target_cache
-        if let Some(cache) = self.hash_target_cache.get() {
-            // Se o cache já foi inicializado, precisamos recriá-lo na próxima vez
-            // Nada a fazer aqui, só na próxima chamada a cache será recriado
-        }
+        // self.hash_target_cache.take(); // Comentado pois requer &mut self
         
-        // --- Armazenar modo aleatório ---
+        // Atualizar modo aleatório
         self.random_mode.store(random_mode, Ordering::Relaxed);
     }
     
-    // Verificar se um hash corresponde ao padrão procurado (zeros no início ou hash específico)
-    // Versão otimizada que usa cache para evitar bloqueios de mutex frequentes
-    #[inline(always)]
+    // Verifica se um hash corresponde ao hash alvo atual
     pub fn check_hash_match(&self, hash: &[u8]) -> bool {
-        // Garantir que o cache está inicializado
-        let cache = self.initialize_hash_target_cache();
-        
-        match cache.mode {
-            // Comparação direta byte a byte para hash exato
-            HashMatchMode::ExactMatch => {
-                // Versão mais eficiente comparando bytes diretamente
+        // Usar o cache de hash para uma melhor performance
+        if let Some(_cache) = self.hash_target_cache.get() {
+            // Garantir que o cache está inicializado
+            let cache = self.initialize_hash_target_cache();
+            
+            match cache.mode {
+                // Comparação direta byte a byte para hash exato
+                HashMatchMode::ExactMatch => {
+                    // Versão mais eficiente comparando bytes diretamente
+                    if hash.len() != 20 {
+                        return false;
+                    }
+                    
+                    let target_hash = &cache.hash;
+                    for i in 0..20 {
+                        if hash[i] != target_hash[i] {
+                            return false;
+                        }
+                    }
+                    
+                    true
+                },
+                // Verificação de prefixo zero
+                HashMatchMode::ZeroPrefix => {
+                    let zero_prefix_length = cache.zero_prefix_length;
+                    if zero_prefix_length == 0 {
+                        return false;
+                    }
+                    
+                    let zero_bytes = zero_prefix_length / 2;
+                    let zero_bits = zero_prefix_length % 2 * 4;
+                    
+                    // Verificar bytes completos de zeros
+                    for i in 0..zero_bytes {
+                        if i >= hash.len() || hash[i] != 0 {
+                            return false;
+                        }
+                    }
+                    
+                    // Verificar bits parciais (se houver)
+                    if zero_bits > 0 && zero_bytes < hash.len() {
+                        let mask = 0xF0 >> zero_bits;
+                        if hash[zero_bytes] & mask != 0 {
+                            return false;
+                        }
+                    }
+                    
+                    true
+                }
+            }
+        } else {
+            // Implementação de fallback caso o cache não esteja disponível
+            let target_hash = self.get_target_hash();
+            
+            // Verificar se é um hash exato
+            if target_hash != [0u8; 20] {
+                // Comparação direta byte a byte para hash exato
                 if hash.len() != 20 {
                     return false;
                 }
                 
-                let target_hash = &cache.hash;
                 for i in 0..20 {
                     if hash[i] != target_hash[i] {
                         return false;
                     }
                 }
                 
-                true
-            },
-            // Verificação de prefixo zero
-            HashMatchMode::ZeroPrefix => {
-                let zero_prefix_length = cache.zero_prefix_length;
+                return true;
+            } else {
+                // Verificação de prefixo zero
+                let zero_prefix_length = *self.zero_prefix_length.lock().unwrap();
                 if zero_prefix_length == 0 {
                     return false;
                 }
@@ -256,7 +302,7 @@ impl AppState {
                     }
                 }
                 
-                true
+                return true;
             }
         }
     }
@@ -340,4 +386,25 @@ impl AppState {
     pub fn should_resume(&self) -> bool {
          self.get_resume_flag()
      }
+
+    // Armazena a instância do AppState para acesso global
+    pub fn set_as_current(app_state: Arc<AppState>) {
+        if let Ok(mut current) = CURRENT_APP_STATE.lock() {
+            *current = Some(app_state);
+        }
+    }
+    
+    // Obtém a instância atual do AppState, se disponível
+    pub fn get_current() -> Option<Arc<AppState>> {
+        if let Ok(current) = CURRENT_APP_STATE.lock() {
+            current.clone()
+        } else {
+            None
+        }
+    }
+}
+
+// Função pública para acessar o AppState atual de qualquer módulo
+pub fn get_current_app_state() -> Option<Arc<AppState>> {
+    AppState::get_current()
 } 

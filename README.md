@@ -20,6 +20,11 @@ O ZeroHash Finder é uma ferramenta projetada para procurar chaves privadas Bitc
 - **Balanceamento de Carga Dinâmico:** Implementa um sistema de divisão dinâmica de trabalho entre threads, permitindo que workers mais rápidos ajudem os mais lentos, melhorando significativamente a utilização de CPU.
 - **Detecção Automática de Arquitetura:** Identifica automaticamente as instruções suportadas pela CPU e habilita otimizações específicas em tempo de compilação.
 - **Retomada de Progresso:** No modo sequencial, salva a última chave processada a cada 5 segundos em `zerohash_progress.txt` e retoma automaticamente a partir desse ponto seguinte se a busca for interrompida e reiniciada com o mesmo range. O sistema verifica automaticamente se o arquivo existe e usa seu conteúdo para recomeçar do ponto onde parou. (Não aplicável ao modo aleatório, que inicia sempre do começo).
+  - **Sistema de Progresso JSON:** Um sistema avançado foi implementado para salvar o progresso em formato JSON (`zerohash_progress.json`), permitindo manter múltiplos estados de progresso para diferentes combinações de endereços e ranges. Isso significa que você pode:
+    - Testar múltiplos ranges para o mesmo endereço e retomar cada um de onde parou
+    - Alternar entre diferentes endereços sem perder o progresso de nenhum
+    - Manter um histórico completo de todas as buscas com timestamps da última execução
+  - O sistema de progresso JSON é robusto e mantém compatibilidade com o formato antigo para garantir que buscas anteriores possam ser retomadas.
 - **Saída Detalhada:** Exibe o endereço P2PKH, P2WPKH, P2SH-P2WPKH, a chave privada em WIF e hexadecimal, e o hash160 quando uma correspondência é encontrada. Os resultados também são salvos em `found_keys.txt`.
 - **Suporte a Tipos Modernos de Endereços:** Total compatibilidade com P2WPKH (endereços bech32) e P2SH-P2WPKH, além dos tradicionais P2PKH.
 - **Parada Elegante:** Responde ao sinal Ctrl+C para interromper a busca de forma limpa.
