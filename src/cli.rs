@@ -23,4 +23,13 @@ pub struct Cli {
     /// Enable random sampling mode instead of sequential search
     #[arg(long, default_value_t = false)]
     pub random: bool,
+    
+    /// Enable verbose output
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+// Função para fazer o parse dos argumentos
+pub fn parse_args() -> Result<Cli, clap::Error> {
+    Cli::try_parse()
 } 

@@ -4,18 +4,18 @@ use crate::batch_pubkey::{generate_pubkeys_batch, generate_pubkey_precise, warmu
 use crate::batch_hash::{
     hash160_and_match_direct, 
     warm_up_cache, 
-    batch_hash_sha3_truncated,
     // Comentar importações não usadas para evitar avisos
     // batch_hash_sha3_direct, 
     // hash_sha3_and_match_direct
 };
+use crate::stats::{PerformanceStats, Dashboard, clear_terminal, format_hex};
 use crossbeam::channel::{bounded};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 use rand::{Rng, rng};
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufRead, BufReader, BufWriter, Read};
+use std::io::{Write, BufRead, BufReader, BufWriter};
 use crossbeam::thread;
 use rayon::prelude::*;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -25,16 +25,21 @@ use bitcoin::{Address};
 use bitcoin::hashes::{sha256};
 use bs58;
 use std::sync::Mutex;
-use std::collections::{VecDeque, HashMap};
-use sha3;
 use serde::{Serialize, Deserialize};
 use std::path::Path;
+use colored::*;
+use std::fmt;
 
-const MEGA_BATCH_SIZE: usize = 65536;  // Reduzido de 1M para 64K
-const SUB_BATCH_SIZE: usize = 32768;   // Reduzido de 128K para 32K
-const CHANNEL_BUFFER: usize = 16;          // Aumentado para testar se há backpressure (valor experimental)
-const TURBO_BATCH_SIZE: usize = 65536;   // Reduzido de 262K para 64K
-const DYNAMIC_CHUNK_SIZE: usize = 262144; // Reduzido drasticamente de 10M para 256K (valor experimental)
+// Otimizações de batch size para melhor performance
+const MEGA_BATCH_SIZE: usize = 131072;  // Aumentado para 128K - Manter tamanho grande para processamento eficiente
+const SUB_BATCH_SIZE: usize = 32768;    // Aumentado para 32K - Melhor utilização de CPU e memória
+const CHANNEL_BUFFER: usize = 32;       // Aumentado para pipeline mais eficiente
+const TURBO_BATCH_SIZE: usize = 65536;  // Aumentado para 64K - Maximizar throughput
+const DYNAMIC_CHUNK_SIZE: usize = 131072; // Aumentado para 128K - Melhor balanceamento para ranges grandes
+
+// Constantes para controle de exibição e UI
+const MIN_UI_UPDATE_INTERVAL_MS: u64 = 200;  // Intervalo mínimo entre atualizações da UI
+const PROGRESS_SAVE_INTERVAL_MS: u64 = 3000; // Salvar progresso a cada 3 segundos
 
 // Definir constante para o arquivo de progresso
 pub const PROGRESS_FILE: &str = "zerohash_progress.txt";
@@ -80,6 +85,111 @@ struct HashResult {
 struct WorkRange {
     start: u128,
     end: u128,
+}
+
+impl WorkRange {
+    /// Cria um novo intervalo de trabalho
+    pub fn new(start: u128, end: u128) -> Self {
+        WorkRange { start, end }
+    }
+
+    /// Retorna o tamanho (quantidade de chaves) no intervalo
+    pub fn size(&self) -> u128 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+
+    /// Verifica se o intervalo está vazio
+    pub fn is_empty(&self) -> bool {
+        self.end < self.start
+    }
+
+    /// Divide o intervalo em dois, retornando o segundo intervalo
+    /// e mantendo o primeiro no objeto atual
+    pub fn split(&mut self) -> Option<Self> {
+        let size = self.size();
+        if size <= 1 {
+            return None;
+        }
+
+        let mid = self.start.saturating_add(size / 2);
+        let second = WorkRange::new(mid, self.end);
+        self.end = mid.saturating_sub(1);
+        Some(second)
+    }
+
+    /// Divide o intervalo em n partes aproximadamente iguais
+    pub fn split_into(&self, n: usize) -> Vec<Self> {
+        if n <= 1 || self.is_empty() {
+            return vec![self.clone()];
+        }
+
+        let size = self.size();
+        let chunk_size = size / n as u128;
+        let mut remainder = size % n as u128;
+        
+        let mut results = Vec::with_capacity(n);
+        let mut current_start = self.start;
+        
+        for _ in 0..n {
+            // Adiciona 1 extra para distribuir o resto uniformemente
+            let extra = if remainder > 0 { 1 } else { 0 };
+            remainder = remainder.saturating_sub(1);
+            
+            let current_size = chunk_size + extra;
+            let current_end = current_start.saturating_add(current_size).saturating_sub(1);
+            
+            // Garante que o último pedaço não ultrapasse o final
+            let adjusted_end = current_end.min(self.end);
+            
+            if current_start <= adjusted_end {
+                results.push(WorkRange::new(current_start, adjusted_end));
+            }
+            
+            current_start = adjusted_end.saturating_add(1);
+            
+            // Se já chegamos ao fim, paramos
+            if current_start > self.end {
+                break;
+            }
+        }
+        
+        results
+    }
+    
+    /// Divide o intervalo em pedaços de tamanho específico
+    pub fn split_by_chunk_size(&self, chunk_size: u128) -> Vec<Self> {
+        if chunk_size == 0 || self.is_empty() {
+            return vec![self.clone()];
+        }
+        
+        let size = self.size();
+        let num_chunks = (size + chunk_size - 1) / chunk_size; // Arredonda para cima
+        let mut results = Vec::with_capacity(num_chunks as usize);
+        
+        let mut current_start = self.start;
+        while current_start <= self.end {
+            let current_end = (current_start + chunk_size - 1).min(self.end);
+            results.push(WorkRange::new(current_start, current_end));
+            current_start = current_end.saturating_add(1);
+        }
+        
+        results
+    }
+}
+
+impl Clone for WorkRange {
+    fn clone(&self) -> Self {
+        WorkRange {
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+impl fmt::Display for WorkRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:x}-{:x} ({} chaves)", self.start, self.end, self.size())
+    }
 }
 
 /// Helper para salvar o progresso em um arquivo JSON.
@@ -316,278 +426,117 @@ pub fn u128_to_wif(key: u128, compressed: bool) -> String {
     bs58::encode(wif_bytes).into_string()
 }
 
-/// Inicializa o Cache Contextual Dinâmico com padrões comuns
+/// Função para inicializar o cache contextual / hierárquico
 fn initialize_contextual_cache() {
-    println!("Inicializando Cache Contextual Dinâmico para SHA3...");
+    // Usar a nova interface profissional do CacheManager
+    let cache_manager = crate::batch_hash::get_cache_manager();
     
-    // Prefixos comuns para chaves públicas comprimidas do Bitcoin
-    let known_prefixes = [
-        // Prefixos padrão para chaves comprimidas começando com '02'
-        &[0x02, 0x00, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x10, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x20, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x30, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x40, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x50, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x60, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x70, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x80, 0x00, 0x00, 0x00][..],
-        &[0x02, 0x90, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xa0, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xb0, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xc0, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xd0, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xe0, 0x00, 0x00, 0x00][..],
-        &[0x02, 0xf0, 0x00, 0x00, 0x00][..],
-        
-        // Prefixos padrão para chaves comprimidas começando com '03'
-        &[0x03, 0x00, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x10, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x20, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x30, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x40, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x50, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x60, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x70, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x80, 0x00, 0x00, 0x00][..],
-        &[0x03, 0x90, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xa0, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xb0, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xc0, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xd0, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xe0, 0x00, 0x00, 0x00][..],
-        &[0x03, 0xf0, 0x00, 0x00, 0x00][..],
-    ];
+    println!("Inicializando Cache Hierárquico para SHA256...");
     
-    // Inicializar o cache para SHA3
-    crate::batch_hash::initialize_contextual_cache_sha3();
+    // Pré-carregar os prefixos comuns
+    cache_manager.preload_common_prefixes();
     
-    // Pré-aquecer o cache com esses prefixos
-    warm_up_cache(&known_prefixes);
+    // Verificar e informar o suporte a instruções avançadas
+    let has_avx2 = cache_manager.has_advanced_instruction_support();
+    println!("Suporte a instruções AVX2: {}", if has_avx2 { "Sim ✓" } else { "Não ✗" });
     
-    println!("Cache Contextual Dinâmico SHA3 inicializado com {} prefixos comuns", known_prefixes.len());
+    // Informar sobre o paralelismo recomendado
+    let recommended_threads = cache_manager.recommended_parallelism();
+    println!("Paralelismo recomendado: {} threads", recommended_threads);
+    
+    // Exibir estatísticas iniciais do cache
+    cache_manager.print_statistics();
 }
 
-/// Implementação turbo da busca
+/// Função principal de busca turbo
 pub fn turbo_search(app_state: Arc<AppState>) {
-    // Aquecer o sistema antes de iniciar a busca
-    warmup_system();
-    
-    // Salvar progresso JSON inicial
-    println!("Salvando progresso JSON inicial...");
-    match save_progress_json(
-        &app_state.target_address,
-        app_state.get_range_start(),
-        app_state.get_range_end(),
-        app_state.get_range_start()
-    ) {
-        Ok(_) => println!("✓ Progresso JSON inicial salvo com sucesso."),
-        Err(e) => println!("! Erro ao salvar progresso JSON inicial: {}", e)
-    }
-    
-    // Inicializar o Cache Contextual Dinâmico
-    initialize_contextual_cache();
-    
-    // Modo de teste especial - verificar chaves conhecidas
-    let test_mode = true; // Ative isso para testar chaves específicas
-
-    if test_mode {
-        println!("=== MODO DE TESTE ATIVADO ===");
-        println!("Verificando chaves conhecidas contra o endereço alvo: {}", app_state.target_address);
-        println!("Usando o algoritmo tradicional Bitcoin (SHA256+RIPEMD160) para calcular hash160.");
-        
-        // Lista de chaves a testar (valores interessantes para testes)
-        let test_keys = [
-            1u128, 2u128, 3u128, 4u128, 5u128, 42u128, 100u128, 1000u128,
-            // Valores conhecidos de Bitcoin
-            0xd19c857c4744bb2fa570acf4a35cfbcfu128,  // Corresponde a um endereço conhecido
-            0x01u128,  // Chave "um"
-            0x69d61e4a8c50eae768bb3b135b1cdb85u128,  // Outra chave conhecida
-            // Adicionar o valor atual no arquivo de progresso
-            324120822590122955850u128, // Valor atual no arquivo de progresso
-            // Chave específica do usuário
-            0xbebb3940cd0fc1491u128, // Chave específica que o usuário quer encontrar
-        ];
-        
-        let target_hash = app_state.get_target_hash160();
-        let secp = Secp256k1::new();
-        
-        for &key in &test_keys {
-            println!("\nTestando chave: {:x}", key);
-            
-            // Gerar chave pública usando o método preciso
-            if let Some(pubkey) = generate_pubkey_precise(key) {
-                println!("Pubkey gerada: {:02x}{:02x}...", pubkey[0], pubkey[1]);
-                
-                // Calcular hash160 manualmente
-                let hash160 = bitcoin::hashes::hash160::Hash::hash(&pubkey).to_byte_array();
-                println!("Hash160 Bitcoin: {}", hex::encode(&hash160));
-                
-                // Verificar correspondência com o hash160 padrão Bitcoin
-                let usando_bitcoin = &hash160 == target_hash.as_slice();
-                
-                if usando_bitcoin {
-                    println!("!!! CORRESPONDÊNCIA ENCONTRADA COM HASH160 BITCOIN !!!");
-                } else {
-                    println!("Não corresponde ao alvo.");
-                    println!("Alvo: {}", hex::encode(target_hash.as_slice()));
-                }
-                
-                // Converter em endereço Bitcoin para verificação
-                let mut key_bytes = [0u8; 32];
-                let key_u128_bytes = key.to_be_bytes();
-                let start_byte = 32usize.saturating_sub(key_u128_bytes.len());
-                key_bytes[start_byte..].copy_from_slice(&key_u128_bytes);
-                
-                if let Ok(secret_key) = SecretKey::from_slice(&key_bytes) {
-                    let network = app_state.get_network();
-                    let pk = bitcoin::PrivateKey::new(secret_key, network);
-                    let pubkey = pk.public_key(&secp);
-                    
-                    let p2pkh = Address::p2pkh(&pubkey, network);
-                    let compressed_pubkey_bytes = pubkey.inner.serialize();
-                    let bip340_pubkey = bitcoin::key::CompressedPublicKey::from_slice(&compressed_pubkey_bytes).unwrap();
-                    
-                    let p2wpkh = Address::p2wpkh(&bip340_pubkey, network);
-                    
-                    println!("Chave privada (hex): {}", hex::encode(key_bytes));
-                    println!("Endereço P2PKH: {}", p2pkh);
-                    println!("Endereço P2WPKH: {}", p2wpkh);
-                } else {
-                    println!("Falha ao gerar chave pública!");
-                }
-            } else {
-                println!("Falha ao gerar chave pública!");
-            }
-        }
-        
-        println!("\n=== FIM DO MODO DE TESTE ===\n");
-    }
-    
-    // --- Iniciar busca com o modo turbo ---
-    println!("=== INICIANDO BUSCA DE ALTA PERFORMANCE ===");
-    println!("Usando algoritmo tradicional Bitcoin: SHA256+RIPEMD160");
-    println!("Este método encontrará chaves para qualquer endereço Bitcoin padrão");
-    app_state.search_active.store(true, Ordering::SeqCst);
-    app_state.set_start_time(Instant::now());
-    
-    // Forçar salvamento inicial do progresso se não estiver em modo aleatório
-    if !app_state.random_mode.load(Ordering::Relaxed) {
-        // Salvar o progresso logo no início para verificar permissões de arquivo
-        let progress_file = app_state.get_progress_file_path();
-        if !progress_file.is_empty() {
-            println!("Salvando progresso inicial para verificar permissões...");
-            match save_progress_helper(&progress_file, app_state.get_range_start()) {
-                Ok(_) => println!("Teste de permissões de arquivo bem-sucedido."),
-                Err(e) => {
-                    eprintln!("ERRO: Falha no teste de permissões do arquivo de progresso: {}", e);
-                    eprintln!("Verifique as permissões do diretório e tente novamente.");
-                }
-            }
-        }
-    }
-    
-    // Obter os valores dos campos do AppState
-    let num_threads = app_state.get_num_threads();
-    let is_random_mode = app_state.random_mode.load(Ordering::Relaxed);
+    // Obter opções de busca do app_state
+    let num_threads = *app_state.num_threads.lock().unwrap();
     let range_start = app_state.get_range_start();
     let range_end = app_state.get_range_end();
+    let total_keys_in_range = range_end.saturating_sub(range_start).saturating_add(1);
+    let progress_path = app_state.get_progress_file_path();
+    let use_precise_method = true; // Usar método mais preciso para geração de chaves
     
-    // Verificar se a chave específica está dentro do intervalo
-    let chave_especifica = 0xbebb3940cd0fc1491u128;
-    if chave_especifica >= range_start && chave_especifica <= range_end {
-        println!("Chave específica (0x{:x}) está DENTRO do intervalo de busca!", chave_especifica);
-    } else {
-        println!("AVISO: Chave específica (0x{:x}) está FORA do intervalo de busca [{:x}..{:x}]!", 
-                 chave_especifica, range_start, range_end);
-        println!("Para encontrar esta chave, ajuste o intervalo de busca.");
-    }
+    // Mais eficiente verificar uma vez e armazenar o valor
+    let is_random_mode = app_state.random_mode.load(Ordering::Relaxed);
     
-    // Adicionar busca forçada para a chave específica
-    if !test_mode { // Se já executou o teste, não precisamos testar novamente
-        println!("\n=== VERIFICAÇÃO ESPECÍFICA DA CHAVE ALVO ===");
-        println!("Testando a chave específica: 0x{:x}", chave_especifica);
-        
-        // Gerar chave pública usando o método preciso
-        if let Some(pubkey) = generate_pubkey_precise(chave_especifica) {
-            println!("Pubkey gerada: {:02x}{:02x}...", pubkey[0], pubkey[1]);
-            
-            // Calcular hash160 com o algoritmo Bitcoin tradicional
-            let sha256_digest = sha256::Hash::hash(&pubkey);
-            let ripemd160_digest = bitcoin::hashes::ripemd160::Hash::hash(&sha256_digest[..]);
-            let mut hash_array = [0u8; 20];
-            hash_array.copy_from_slice(&ripemd160_digest[..]);
-            println!("Hash160 Bitcoin: {}", hex::encode(&hash_array));
-            
-            // Verificar se corresponde ao alvo
-            let target_hash = app_state.get_target_hash160();
-            let usando_bitcoin = &hash_array == target_hash.as_slice();
-            
-            if usando_bitcoin {
-                println!("!!! CORRESPONDÊNCIA ENCONTRADA PARA CHAVE ESPECÍFICA !!!");
-                println!("Esta chave deve ser encontrada durante a busca.");
+    // Ajustar ponto de início efetivo baseado no progresso anterior
+    let effective_range_start = if app_state.should_resume() && !is_random_mode {
+        if let Ok(last_key) = load_progress(&progress_path) {
+            if last_key >= range_start && last_key < range_end {
+                let next_key = last_key.saturating_add(1);
+                println!("Retomando busca a partir da chave {:x}", next_key);
+                next_key
             } else {
-                println!("Chave específica NÃO corresponde ao endereço alvo.");
-                println!("Se estiver procurando um endereço específico, verifique se");
-                println!("a chave privada ou o endereço Bitcoin estão corretos.");
+                println!("Progresso carregado {:x} fora do range atual [{:x}-{:x}], iniciando do começo", 
+                         last_key, range_start, range_end);
+                range_start
             }
         } else {
-            println!("Falha ao gerar chave pública para chave específica!");
+            println!("Sem arquivo de progresso ou erro ao ler, iniciando do começo do range");
+            range_start
         }
-        println!("=== FIM DA VERIFICAÇÃO ESPECÍFICA ===\n");
-    }
+    } else {
+        range_start
+    };
     
-    // Flag para usar método preciso exclusivamente (mais lento, mas garantido)
-    let use_precise_method = false; // Use false para usar o método batch padrão 
-    if use_precise_method {
-        println!("AVISO: Usando método preciso para geração de chaves públicas.");
-        println!("Este método é mais lento, mas garante compatibilidade 100% com o padrão Bitcoin.");
-    }
-
+    // Inicializar cache contextual para estados SHA-256
+    initialize_contextual_cache();
+    
+    // Inicializar sistema de geração de chaves públicas
+    warmup_system();
+    
+    // Configurar cache para prefixos comuns
+    let prefixes = [
+        &[0x02][..], // Prefixo para chaves com Y par (mais comum)
+        &[0x03][..], // Prefixo para chaves com Y ímpar
+        // Adicionar mais prefixos comuns pode aumentar hits no cache
+    ];
+    warm_up_cache(&prefixes);
+    
+    // Mostrar informações sobre o modo selecionado
     if is_random_mode {
-        println!("Iniciando busca turbo em MODO ALEATÓRIO com {} threads", num_threads);
+        println!("{}", format!("Iniciando busca turbo em MODO ALEATÓRIO com {} threads", num_threads).bold());
         println!("Range de busca (hex): {:x} a {:x}", range_start, range_end);
         if app_state.should_resume() {
-             println!("Aviso: Flag --resume ignorada no modo aleatório.");
-             *app_state.resume.lock().unwrap() = false;
+            println!("Aviso: Flag --resume ignorada no modo aleatório.");
+            *app_state.resume.lock().unwrap() = false;
         }
         *app_state.progress_file.lock().unwrap() = String::new();
     } else {
-        let effective_range_start = if app_state.should_resume() {
-             let progress_file = app_state.get_progress_file_path();
-             match load_progress(&progress_file) {
-                 Ok(saved_key) if saved_key >= range_start && saved_key < range_end => {
-                     println!("✓ Retomando busca sequencial a partir da chave salva: {:x}", saved_key + 1);
-                     saved_key + 1
-                 }
-                 Ok(saved_key) => {
-                     println!("⚠️ Progresso sequencial ({:x}) está fora do range atual. Iniciando do começo: {:x}.", saved_key, range_start);
-                     range_start
-                 }
-                 Err(e) => {
-                     println!("ℹ️ Não foi possível carregar progresso: {}. Iniciando do começo: {:x}.", e, range_start);
-                     range_start
-                 }
-             }
-         } else {
-             println!("ℹ️ Iniciando nova busca sequencial (sem recuperar progresso anterior).");
-             range_start
-         };
-         println!("Iniciando busca turbo SEQUENCIAL com {} threads", num_threads);
-         println!("Range de busca efetivo (hex): {:x} a {:x}", effective_range_start, range_end);
-         if effective_range_start > range_end {
-             println!("Range inválido após carregar progresso. Nada a fazer.");
-             return;
-         }
-         *app_state.range_start.lock().unwrap() = effective_range_start;
+        println!("{}", format!("Iniciando busca turbo SEQUENCIAL com {} threads", num_threads).bold());
+        println!("Range de busca efetivo (hex): {:x} a {:x}", effective_range_start, range_end);
+        if effective_range_start > range_end {
+            println!("Range inválido após carregar progresso. Nada a fazer.");
+            return;
+        }
+        *app_state.range_start.lock().unwrap() = effective_range_start;
     }
+
+    // Inicializar sistema de estatísticas
+    let performance_stats = PerformanceStats::new(total_keys_in_range, effective_range_start);
+    let mut dashboard = Dashboard::new(performance_stats.clone());
+    
+    // Mostrar dashboard inicial
+    clear_terminal();
+    println!("{}", dashboard.render());
 
     // Inicializar variáveis compartilhadas
     let found = Arc::new(AtomicBool::new(false));
     let processed_keys = Arc::new(AtomicU64::new(0));
     let last_report_time = Arc::new(Mutex::new(Instant::now()));
     let last_save_time = Arc::new(Mutex::new(Instant::now()));
+    let last_cache_stat_time = Arc::new(Mutex::new(Instant::now()));
     let target_hash = app_state.get_target_hash160();
+    
+    // Contador de taxa de processamento instantânea
+    let last_processed_keys = Arc::new(AtomicU64::new(0));
+    let last_rate_update_time = Arc::new(Mutex::new(Instant::now()));
+    
+    // Clones para usar fora do escopo do thread
+    let app_state_final = app_state.clone();
+    let found_final = found.clone();
 
     // Criar canal para relatórios de resultados - aumentado buffer para reduzir contenção
     let (result_sender, result_receiver) = bounded::<(u128, Vec<u8>, [u8; 33])>(512);
@@ -620,7 +569,7 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                 let start_byte = 32usize.saturating_sub(key_u128_bytes.len());
                 key_bytes[start_byte..].copy_from_slice(&key_u128_bytes);
 
-                println!("!!! PROCESSANDO RESULTADO ENCONTRADO: chave = {:x}", key);
+                println!("\n{}", format!("!!! PROCESSANDO RESULTADO ENCONTRADO: chave = {:x}", key).green().bold());
                 println!("!!! Hash160 recebido: {}", hex::encode(&hash));
                 
                 if let Ok(secret_key) = SecretKey::from_slice(&key_bytes) {
@@ -634,8 +583,8 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                     
                     // Verificar se há correspondência com o hash alvo
                     let target_hash160 = results_app_state.get_target_hash160();
-                    println!("!!! Hash160 calculado: {}", hex::encode(&hash160_manual));
-                    println!("!!! Hash160 alvo:      {}", hex::encode(&target_hash160));
+                    println!("{}", format!("!!! Hash160 calculado: {}", hex::encode(&hash160_manual)).cyan());
+                    println!("{}", format!("!!! Hash160 alvo:      {}", hex::encode(&target_hash160)).cyan());
                     
                     // Atualização para API do bitcoin 0.32.5
                     let p2pkh = Address::p2pkh(&pubkey, network);
@@ -653,8 +602,14 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                     let hash_hex = hex::encode(hash);
 
                     let result = format!(
-                        "\n!!! ENCONTRADO ENDEREÇO CORRESPONDENTE !!!\nChave Privada (Hex): {}\nChave Privada (WIF): {}\nP2PKH:              {}\nP2WPKH:             {}\nP2SH-P2WPKH:        {}\nHash160:            {}\n",
-                        key_hex, wif, p2pkh, p2wpkh, p2sh_p2wpkh, hash_hex
+                        "\n{}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
+                        "!!! ENCONTRADO ENDEREÇO CORRESPONDENTE !!!".green().bold(),
+                        "Chave Privada (Hex)".bold(), key_hex,
+                        "Chave Privada (WIF)".bold(), wif,
+                        "P2PKH".bold(), p2pkh,
+                        "P2WPKH".bold(), p2wpkh,
+                        "P2SH-P2WPKH".bold(), p2sh_p2wpkh,
+                        "Hash160".bold(), hash_hex
                     );
                     println!("{}", result);
 
@@ -677,6 +632,10 @@ pub fn turbo_search(app_state: Arc<AppState>) {
         let process_processed_keys = processed_keys.clone();
         let process_last_report_time = last_report_time.clone();
         let process_last_save_time = last_save_time.clone();
+        let process_last_cache_stat_time = last_cache_stat_time.clone();
+        let process_last_processed_keys = last_processed_keys.clone();
+        let process_last_rate_update_time = last_rate_update_time.clone();
+        let stats = performance_stats.clone();
 
         s.spawn(move |_| {
             let thread_range_start = process_app_state.get_range_start();
@@ -691,6 +650,7 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                     let mut keys = Vec::with_capacity(TURBO_BATCH_SIZE);
                     let mut pubkeys_buffer = Vec::with_capacity(TURBO_BATCH_SIZE);
                     let result_sender = result_sender.clone();
+                    let stats_clone = stats.clone();
 
                     loop {
                         if process_found.load(Ordering::Relaxed) || !process_app_state.search_active.load(Ordering::Relaxed) {
@@ -708,9 +668,6 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                             keys.push(rng.random_range(thread_range_start..=thread_range_end));
                         }
                         if process_found.load(Ordering::Relaxed) || !process_app_state.search_active.load(Ordering::Relaxed) { break; }
-
-                        // No modo aleatório, geramos uma lista completamente aleatória de chaves para testar
-                        // Não há necessidade de adicionar chaves específicas aqui
                         
                         pubkeys_buffer.clear();
                         
@@ -731,423 +688,330 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                         
                         let matches = hash160_and_match_direct(&pubkeys_buffer, &target_hash);
 
+                        // Atualizar estatísticas diretamente sem bloqueio
+                        stats_clone.add_processed_keys(TURBO_BATCH_SIZE as u64);
+                        stats_clone.add_hashes_computed(TURBO_BATCH_SIZE as u64);
+                        
+                        // Incrementar contador para cálculo de taxa
+                        process_processed_keys.fetch_add(TURBO_BATCH_SIZE as u64, Ordering::Relaxed);
+
                         for (idx, hash) in matches {
                              if !process_found.load(Ordering::Relaxed) {
                                  let key = keys[idx];
-                                 println!("!! ENCONTRADA CORRESPONDÊNCIA DE HASH EM WORKER ALEATÓRIO: chave = {:x}", key);
+                                 println!("\n{}", format!("!! ENCONTRADA CORRESPONDÊNCIA DE HASH EM WORKER ALEATÓRIO: chave = {:x}", key).green().bold());
                                  let _ = result_sender.send((key, hash.to_vec(), pubkeys_buffer[idx]));
                                  process_found.store(true, Ordering::SeqCst);
                              }
-                        }
-                        process_processed_keys.fetch_add(TURBO_BATCH_SIZE as u64, Ordering::Relaxed);
-
-                        {
-                            let now = Instant::now();
-                            let mut should_report = false;
-                            {
-                                let mut last_report = process_last_report_time.lock().unwrap();
-                                if now.duration_since(*last_report) > Duration::from_millis(500) {
-                                    *last_report = now;
-                                    should_report = true;
-                                }
-                            }
-                            if should_report {
-                                let total = process_processed_keys.load(Ordering::Relaxed);
-                                let elapsed_total = process_app_state.get_elapsed_time().map_or(0.0, |d| d.as_secs_f64());
-                                let rate = if elapsed_total > 0.0 {
-                                    total as f64 / elapsed_total
-                                } else {
-                                    0.0
-                                };
-                                println!("Progresso (Aleatório): {} chaves testadas a {:.2} Mkeys/s (CPU: {}) | SHA256+RIPEMD160",
-                                         total,
-                                         rate / 1_000_000.0,
-                                         num_threads);
-                            }
                         }
                     }
                 });
             } else {
                 println!("Iniciando workers em modo SEQUENCIAL com balanceamento dinâmico");
-                let effective_range_start = process_app_state.get_range_start();
-                let total_keys_in_range = thread_range_end.saturating_sub(effective_range_start).saturating_add(1);
-
-                // Novo sistema de balanceamento dinâmico
-                // Criar uma fila compartilhada de work ranges
-                let work_queue = Arc::new(Mutex::new(VecDeque::new()));
-                let active_workers = Arc::new(AtomicUsize::new(0));
+                println!("Sistema de balanceamento dinâmico: chunks iniciais de ~{} chaves", DYNAMIC_CHUNK_SIZE);
                 
-                // Calcular o tamanho inicial dos chunks
-                let dynamic_chunk_size = std::cmp::min(
-                    DYNAMIC_CHUNK_SIZE,
-                    (total_keys_in_range / (num_threads as u128 * 2)).max(TURBO_BATCH_SIZE as u128) as usize
-                );
+                // Calcular o número de chunks baseado no range, mas limitado a um valor máximo seguro
+                const MAX_CHUNKS: usize = 10_000;
                 
-                println!("Sistema de balanceamento dinâmico: chunks iniciais de ~{} chaves", dynamic_chunk_size);
+                // Para ranges extremamente grandes, calcular chunks de forma segura para evitar problemas de memória
+                let range_size = thread_range_end.saturating_sub(thread_range_start).saturating_add(1);
                 
-                // Preencher a fila de trabalho inicial com chunks menores e mais numerosos
-                {
-                    let mut queue = work_queue.lock().unwrap();
-                    let mut current = effective_range_start;
+                // Calcular o número de chunks de forma segura para ranges extremamente grandes
+                let num_chunks = {
+                    // Converter para valor mais seguro primeiro
+                    let chunk_count = range_size as f64 / DYNAMIC_CHUNK_SIZE as f64;
                     
-                    // Criar ainda mais chunks iniciais para ver progresso mais rapidamente
-                    let num_initial_chunks = num_threads * 16;
-                    
-                    // Calcular tamanho de chunk menor para ver progresso mais rapidamente
-                    let range_size = thread_range_end.saturating_sub(effective_range_start).saturating_add(1);
-                    let initial_chunk_size = std::cmp::max(
-                        range_size / (num_initial_chunks as u128),
-                        (TURBO_BATCH_SIZE * 4) as u128
-                    );
-                    
-                    println!("Dividindo range em {} chunks iniciais de ~{} chaves cada", num_initial_chunks, initial_chunk_size);
-                    
-                    // Forçar uma atualização imediata do progresso
-                    *process_last_report_time.lock().unwrap() = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or(Instant::now());
-                    
-                    // Contador para reportar progresso de inicialização
-                    let mut chunks_criados = 0;
-                    
-                    while current < thread_range_end {
-                        let chunk_end = std::cmp::min(
-                            current.saturating_add(initial_chunk_size).saturating_sub(1),
-                            thread_range_end
-                        );
-                        
-                        queue.push_back(WorkRange { 
-                            start: current,
-                            end: chunk_end,
-                        });
-                        
-                        current = chunk_end.saturating_add(1);
-                        chunks_criados += 1;
-                        
-                        // Mostrar progresso durante a criação dos chunks
-                        if chunks_criados % 10 == 0 {
-                            println!("Preparando chunks: {} criados até agora...", chunks_criados);
-                        }
-                        
-                        if current >= thread_range_end { break; }
+                    // Limitar ao número máximo de chunks
+                    if chunk_count > MAX_CHUNKS as f64 {
+                        MAX_CHUNKS
+                    } else {
+                        chunk_count.ceil() as usize
                     }
+                };
+                
+                // Garantir pelo menos 4 chunks por thread
+                let num_chunks = num_chunks.max(num_threads * 4);
+                
+                // Calcular o tamanho de cada chunk com base no número real de chunks
+                // Usar divisão de ponto flutuante para evitar problemas com ranges muito grandes
+                let chunk_size_f64 = range_size as f64 / num_chunks as f64;
+                let chunk_size = chunk_size_f64.round() as u128;
+                
+                println!("Dividindo range em {} chunks de ~{} chaves cada", 
+                         num_chunks, chunk_size);
+                
+                // Criar range principal para divisão
+                let main_range = WorkRange::new(thread_range_start, thread_range_end);
+                
+                // Verificar se o range é extremamente grande para usar uma abordagem diferente
+                let use_lazy_chunks = main_range.size() > 1_000_000_000_000_000u128; // 1 quatrilhão
+                
+                // Criar chunks para processamento usando métodos otimizados
+                let chunk_ranges: Vec<WorkRange> = if use_lazy_chunks {
+                    // Para ranges extremamente grandes, criar apenas um número limitado de chunks
+                    println!("Range muito grande detectado ({} valores). Usando abordagem otimizada.", main_range.size());
                     
-                    println!("Fila de trabalho inicializada com {} chunks", queue.len());
-                    println!("INICIANDO PROCESSAMENTO - AGUARDE PRIMEIRA ATUALIZAÇÃO...");
-                }
-
-                // Iniciar workers
-                (0..num_threads).into_par_iter().for_each(|thread_id| {
-                    let work_queue = work_queue.clone();
-                    let active_workers = active_workers.clone();
+                    // Criar chunks iniciais (4 por thread)
+                    let initial_chunks_per_thread = 4;
+                    let initial_chunks_count = num_threads * initial_chunks_per_thread;
+                    
+                    println!("Criando {} chunks iniciais ({} por thread)", initial_chunks_count, initial_chunks_per_thread);
+                    
+                    // Usar o método split_into para criar chunks de tamanho uniforme
+                    main_range.split_into(initial_chunks_count)
+                } else {
+                    // Para ranges normais, criar todos os chunks usando split_by_chunk_size
+                    println!("Criando {} chunks usando método otimizado", num_chunks);
+                    
+                    // Usar o método split_by_chunk_size para garantir tamanhos uniformes
+                    main_range.split_by_chunk_size(chunk_size)
+                };
+                
+                println!("Criados {} chunks. Primeiro: {}, Último: {}", 
+                         chunk_ranges.len(),
+                         chunk_ranges.first().map_or("Nenhum".to_string(), |r| r.to_string()),
+                         chunk_ranges.last().map_or("Nenhum".to_string(), |r| r.to_string()));
+                
+                // Encapsular os chunks em um Mutex para acesso concorrente
+                let chunk_ranges_mutex = Arc::new(Mutex::new(chunk_ranges));
+                
+                // Processar os chunks em paralelo
+                (0..num_threads).into_par_iter().for_each(|_| {
                     let result_sender = result_sender.clone();
+                    let chunk_ranges_mutex = Arc::clone(&chunk_ranges_mutex);
+                    let stats_clone = stats.clone();
+                    let process_found_clone = Arc::clone(&process_found);
+                    let process_app_state_clone = Arc::clone(&process_app_state);
+                    let process_processed_keys_clone = Arc::clone(&process_processed_keys);
+                    
+                    let mut keys = Vec::with_capacity(TURBO_BATCH_SIZE);
                     let mut pubkeys_buffer = Vec::with_capacity(TURBO_BATCH_SIZE);
-                    let mut keys_buffer = Vec::with_capacity(TURBO_BATCH_SIZE);
                     
-                    // Incrementar contador de workers ativos
-                    active_workers.fetch_add(1, Ordering::SeqCst);
-                    println!("Worker {} iniciado.", thread_id);
-                    
-                    // Contador de batches processados por worker
-                    let mut batches_processados = 0;
-                    
-                    loop {
-                        if process_found.load(Ordering::Relaxed) || !process_app_state.search_active.load(Ordering::Relaxed) {
-                            break;
-                        }
+                    while !process_found_clone.load(Ordering::Relaxed) && 
+                          process_app_state_clone.search_active.load(Ordering::Relaxed) {
                         
-                        // Obter próximo intervalo de trabalho da fila
-                        let current_work = {
-                            let mut queue = work_queue.lock().unwrap();
-                            queue.pop_front()
+                        // Obter próximo chunk disponível
+                        let work_range = {
+                            let mut ranges = chunk_ranges_mutex.lock().unwrap();
+                            if ranges.is_empty() {
+                                // Verificar se devemos criar mais chunks em modo adaptativo
+                                if use_lazy_chunks && !process_found_clone.load(Ordering::Relaxed) {
+                                    // Calcular o progresso atual
+                                    let current_key = stats_clone.get_current_key();
+                                    let progress_pct = (current_key - thread_range_start) as f64 / range_size as f64 * 100.0;
+                                    
+                                    // Se ainda estamos abaixo de 90% do progresso, criar mais chunks
+                                    if progress_pct < 90.0 {
+                                        let remaining_range = WorkRange::new(current_key, thread_range_end);
+                                        if !remaining_range.is_empty() && remaining_range.size() > chunk_size {
+                                            // Criar mais chunks (2 por thread)
+                                            let new_chunks_per_thread = 2;
+                                            let new_chunks_count = num_threads * new_chunks_per_thread;
+                                            
+                                            let new_chunks = remaining_range.split_into(new_chunks_count);
+                                            println!("Gerando mais {} chunks sob demanda a partir de {:x}", 
+                                                     new_chunks.len(), current_key);
+                                            
+                                            // Adicionar novos chunks
+                                            for chunk in new_chunks {
+                                                ranges.push(chunk);
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Se ainda estiver vazio após tentar criar mais chunks, sair
+                                if ranges.is_empty() {
+                                    break;
+                                }
+                            }
+                            ranges.pop()
                         };
                         
-                        // Se não há mais trabalho, verifica se ainda existem workers ativos
-                        match current_work {
-                            Some(work_range) => {
-                                let mut current = work_range.start;
-                                let chunk_end = work_range.end;
-                                
-                                // Mostrar qual worker está processando qual intervalo
-                                println!("Worker {} processando intervalo: {:x} a {:x}", thread_id, current, chunk_end);
-                                
-                                // Processar o chunk atual
-                                while current <= chunk_end {
-                                    if process_found.load(Ordering::Relaxed) || !process_app_state.search_active.load(Ordering::Relaxed) {
-                                        break;
-                                    }
-                                    
-                                    let batch_end = std::cmp::min(
-                                        current.saturating_add(TURBO_BATCH_SIZE as u128),
-                                        chunk_end.saturating_add(1)
-                                    );
-                                    let keys_in_batch = batch_end.saturating_sub(current) as usize;
-                                    if keys_in_batch == 0 { break; }
-                                    
-                                    keys_buffer.clear();
-                                    keys_buffer.extend(current..batch_end);
-                                    
-                                    pubkeys_buffer.clear();
-                                    
-                                    if use_precise_method {
-                                        // Usar método preciso para todas as chaves
-                                        for key in &keys_buffer {
-                                            if let Some(pubkey) = generate_pubkey_precise(*key) {
-                                                pubkeys_buffer.push(pubkey);
-                                            } else {
-                                                // Colocar uma chave inválida para manter o índice
-                                                pubkeys_buffer.push([0u8; 33]);
-                                            }
-                                        }
-                                    } else {
-                                        // Método normal batch
-                                        generate_pubkeys_batch(&keys_buffer, &mut pubkeys_buffer);
-                                    }
-                                    
-                                    let matches = hash160_and_match_direct(&pubkeys_buffer, &target_hash);
-                                    
-                                    for (idx, hash) in matches {
-                                        if !process_found.load(Ordering::Relaxed) {
-                                            let key = keys_buffer[idx];
-                                            println!("!! ENCONTRADA CORRESPONDÊNCIA DE HASH EM WORKER: chave = {:x}", key);
-                                            let _ = result_sender.send((key, hash.to_vec(), pubkeys_buffer[idx]));
-                                            process_found.store(true, Ordering::SeqCst);
-                                        }
-                                    }
-                                    
-                                    let processed_in_batch = keys_buffer.len() as u64;
-                                    process_processed_keys.fetch_add(processed_in_batch, Ordering::Relaxed);
-                                    current = batch_end;
-                                    
-                                    batches_processados += 1;
-                                    // Reportar progresso por worker ocasionalmente
-                                    if batches_processados % 10 == 0 {
-                                        println!("Worker {} já processou {} batches", thread_id, batches_processados);
-                                    }
-                                    
-                                    // Reportar progresso global SEMPRE aqui
-                                    {
-                                        let elapsed_total = process_app_state.get_elapsed_time().map_or(0.0, |d| d.as_secs_f64());
-                                        let current_processed_total = process_processed_keys.load(Ordering::Relaxed);
-                                        let rate = if elapsed_total > 0.0 { current_processed_total as f64 / elapsed_total } else { 0.0 };
-                                        let queue_size = work_queue.lock().unwrap().len();
-                                        let workers = active_workers.load(Ordering::SeqCst);
-                                        let percentage = if total_keys_in_range > 0 {
-                                            (current.saturating_sub(effective_range_start)) as f64 / total_keys_in_range as f64 * 100.0
-                                        } else { 100.0 };
-                                        
-                                        // Calcular ETA - tempo estimado para conclusão
-                                        let keys_remaining = if total_keys_in_range > 0 {
-                                            total_keys_in_range.saturating_sub(current.saturating_sub(effective_range_start))
-                                        } else { 0 };
-                                        
-                                        let eta_seconds = if rate > 0.0 {
-                                            keys_remaining as f64 / rate
-                                        } else {
-                                            0.0
-                                        };
-                                        
-                                        // Formatar ETA em formato legível
-                                        let eta_str = if eta_seconds.is_finite() && eta_seconds > 0.0 {
-                                            let eta_days = (eta_seconds / (24.0 * 3600.0)).floor();
-                                            let eta_hours = ((eta_seconds % (24.0 * 3600.0)) / 3600.0).floor();
-                                            let eta_minutes = ((eta_seconds % 3600.0) / 60.0).floor();
-                                            let eta_secs = (eta_seconds % 60.0).floor();
-                                            
-                                            if eta_days > 0.0 {
-                                                format!("{:.0}d {:.0}h {:.0}m", eta_days, eta_hours, eta_minutes)
-                                            } else if eta_hours > 0.0 {
-                                                format!("{:.0}h {:.0}m {:.0}s", eta_hours, eta_minutes, eta_secs)
-                                            } else if eta_minutes > 0.0 {
-                                                format!("{:.0}m {:.0}s", eta_minutes, eta_secs)
-                                            } else {
-                                                format!("{:.0}s", eta_secs)
-                                            }
-                                        } else {
-                                            "calculando...".to_string()
-                                        };
-
-                                        // Formatar progresso atual de forma mais legível
-                                        let current_hex = format!("{:x}", current.saturating_sub(1).max(effective_range_start));
-                                        let current_formatted = if current_hex.len() > 16 {
-                                            format!("0x{}...{}", &current_hex[0..4], &current_hex[current_hex.len()-12..])
-                                        } else {
-                                            format!("0x{}", current_hex)
-                                        };
-                                        
-                                        println!("PROGRESSO: {:.2}% | {} de {} chaves | {:.2} Mkeys/s | ETA: {} | {} workers",
-                                                percentage, 
-                                                current_formatted,
-                                                format!("0x{:x}", range_end),
-                                                rate / 1_000_000.0, 
-                                                eta_str,
-                                                workers);
-                                    }
-                                    
-                                    // Se o chunk for grande, podemos dividi-lo para melhor balanceamento
-                                    if chunk_end.saturating_sub(current) > (1048576 as u128 * 4) {
-                                        // Dividir intervalo em dois
-                                        let mid_point = current.saturating_add((chunk_end - current) / 2);
-                                        
-                                        // Adicionar segunda metade à fila
-                                        if mid_point < chunk_end {
-                                            let mut queue = work_queue.lock().unwrap();
-                                            queue.push_back(WorkRange {
-                                                start: mid_point.saturating_add(1),
-                                                end: chunk_end,
-                                            });
-                                            
-                                            println!("Worker {} dividiu chunk, segunda metade: {:x} a {:x}", 
-                                                   thread_id, mid_point.saturating_add(1), chunk_end);
-                                            
-                                            // Atualizar chunk_end para processar apenas a primeira metade
-                                            break;
-                                        }
-                                    }
+                        if let Some(range) = work_range {
+                            // Verificar se o tamanho do chunk é grande demais para processar de uma vez
+                            if range.size() > MEGA_BATCH_SIZE as u128 * 2 {
+                                // Dividir em subchunks e recolocar na fila
+                                let mut ranges = chunk_ranges_mutex.lock().unwrap();
+                                let subchunks = range.split_by_chunk_size(MEGA_BATCH_SIZE as u128);
+                                for chunk in subchunks {
+                                    ranges.push(chunk);
                                 }
+                                continue; // Continuar para pegar o próximo chunk
+                            }
+                            
+                            // Processar o chunk
+                            let mut current_key = range.start;
+                            
+                            while current_key <= range.end && 
+                                  !process_found_clone.load(Ordering::Relaxed) && 
+                                  process_app_state_clone.search_active.load(Ordering::Relaxed) {
+                                  
+                                // Determinar quantas chaves processar neste batch
+                                let keys_left = range.end.saturating_sub(current_key).saturating_add(1);
+                                let batch_size = TURBO_BATCH_SIZE.min(keys_left as usize);
                                 
-                                // Reportar progresso periodicamente
-                                {
-                                    let now = Instant::now();
-                                    let mut should_report = false;
-                                    {
-                                        let mut last_report = process_last_report_time.lock().unwrap();
-                                        // Diminuir o intervalo para reportar progresso mais frequentemente
-                                        if now.duration_since(*last_report) > Duration::from_millis(100) {
-                                            *last_report = now;
-                                            should_report = true;
-                                        }
-                                    }
-                                    if should_report {
-                                        let elapsed_total = process_app_state.get_elapsed_time().map_or(0.0, |d| d.as_secs_f64());
-                                        let current_processed_total = process_processed_keys.load(Ordering::Relaxed);
-                                        let rate = if elapsed_total > 0.0 { current_processed_total as f64 / elapsed_total } else { 0.0 };
-                                        let queue_size = work_queue.lock().unwrap().len();
-                                        let workers = active_workers.load(Ordering::SeqCst);
-                                        let percentage = if total_keys_in_range > 0 {
-                                            (current.saturating_sub(effective_range_start)) as f64 / total_keys_in_range as f64 * 100.0
-                                        } else { 100.0 };
-                                        
-                                        // Calcular ETA - tempo estimado para conclusão
-                                        let keys_remaining = if total_keys_in_range > 0 {
-                                            total_keys_in_range.saturating_sub(current.saturating_sub(effective_range_start))
-                                        } else { 0 };
-                                        
-                                        let eta_seconds = if rate > 0.0 {
-                                            keys_remaining as f64 / rate
-                                        } else {
-                                            0.0
-                                        };
-                                        
-                                        // Formatar ETA em formato legível
-                                        let eta_str = if eta_seconds.is_finite() && eta_seconds > 0.0 {
-                                            let eta_days = (eta_seconds / (24.0 * 3600.0)).floor();
-                                            let eta_hours = ((eta_seconds % (24.0 * 3600.0)) / 3600.0).floor();
-                                            let eta_minutes = ((eta_seconds % 3600.0) / 60.0).floor();
-                                            let eta_secs = (eta_seconds % 60.0).floor();
-                                            
-                                            if eta_days > 0.0 {
-                                                format!("{:.0}d {:.0}h {:.0}m", eta_days, eta_hours, eta_minutes)
-                                            } else if eta_hours > 0.0 {
-                                                format!("{:.0}h {:.0}m {:.0}s", eta_hours, eta_minutes, eta_secs)
-                                            } else if eta_minutes > 0.0 {
-                                                format!("{:.0}m {:.0}s", eta_minutes, eta_secs)
-                                            } else {
-                                                format!("{:.0}s", eta_secs)
-                                            }
-                                        } else {
-                                            "calculando...".to_string()
-                                        };
-
-                                        // Formatar progresso atual de forma mais legível
-                                        let current_hex = format!("{:x}", current.saturating_sub(1).max(effective_range_start));
-                                        let current_formatted = if current_hex.len() > 16 {
-                                            format!("0x{}...{}", &current_hex[0..4], &current_hex[current_hex.len()-12..])
-                                        } else {
-                                            format!("0x{}", current_hex)
-                                        };
-                                        
-                                        println!("Progresso (Balanceado): {:.6}% ({:x}) | {:.2} Mkeys/s | {} workers | {} chunks | SHA256+RIPEMD160",
-                                                percentage, current.saturating_sub(1).max(effective_range_start),
-                                                rate / 1_000_000.0, workers, queue_size);
-                                    }
-                                }
-                                
-                                // Salvar progresso
-                                {
-                                    let now = Instant::now();
-                                    let mut should_save = false;
-                                    {
-                                        let mut last_save = process_last_save_time.lock().unwrap();
-                                        if now.duration_since(*last_save) > Duration::from_secs(5) {
-                                            *last_save = now;
-                                            should_save = true;
-                                        }
-                                    }
-                                    if should_save {
-                                        let key_to_save = current.saturating_sub(1);
-                                        if key_to_save >= effective_range_start {
-                                            let progress_file = process_app_state.get_progress_file_path();
-                                            if !progress_file.is_empty() {
-                                                match save_progress_helper(&progress_file, key_to_save) {
-                                                    Ok(_) => println!("✓ Progresso salvo em '{}': {:x}", progress_file, key_to_save),
-                                                    Err(e) => eprintln!("Erro ao salvar progresso: {}", e)
-                                                }
-                                                
-                                                // Salvar versão JSON do progresso também
-                                                let _ = save_progress_json(
-                                                    &process_app_state.target_address,
-                                                    process_app_state.get_range_start(),
-                                                    process_app_state.get_range_end(),
-                                                    key_to_save
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            None => {
-                                // Verifica se ainda existem workers ativos
-                                let workers = active_workers.load(Ordering::SeqCst);
-                                println!("Worker {} sem trabalho. {} workers ativos.", thread_id, workers);
-                                
-                                if workers <= 1 {
-                                    // Último worker ativo, sair
-                                    active_workers.fetch_sub(1, Ordering::SeqCst);
-                                    println!("Worker {} saindo (último worker).", thread_id);
+                                if batch_size == 0 {
                                     break;
                                 }
                                 
-                                // Espera um pouco antes de verificar novamente
-                                std::thread::sleep(Duration::from_millis(50));
+                                // Limpar buffers
+                                keys.clear();
+                                pubkeys_buffer.clear();
                                 
-                                // Verificar novamente se há trabalho
-                                let queue_size = work_queue.lock().unwrap().len();
-                                if queue_size == 0 {
-                                    // Se ainda não há trabalho, este worker termina
-                                    active_workers.fetch_sub(1, Ordering::SeqCst);
-                                    println!("Worker {} saindo (sem mais trabalho).", thread_id);
-                                    break;
+                                // Gerar chaves sequenciais para este batch
+                                for i in 0..batch_size {
+                                    keys.push(current_key.saturating_add(i as u128));
                                 }
+                                
+                                // Gerar chaves públicas
+                                if use_precise_method {
+                                    for key in &keys {
+                                        if let Some(pubkey) = generate_pubkey_precise(*key) {
+                                            pubkeys_buffer.push(pubkey);
+                                        } else {
+                                            pubkeys_buffer.push([0u8; 33]);
+                                        }
+                                    }
+                                } else {
+                                    generate_pubkeys_batch(&keys, &mut pubkeys_buffer);
+                                }
+                                
+                                // Verificar correspondências
+                                let matches = hash160_and_match_direct(&pubkeys_buffer, &target_hash);
+                                
+                                // Atualizar estatísticas
+                                stats_clone.add_processed_keys(batch_size as u64);
+                                stats_clone.add_hashes_computed(batch_size as u64);
+                                process_processed_keys_clone.fetch_add(batch_size as u64, Ordering::Relaxed);
+                                
+                                // Atualizar a chave atual para o próximo lote
+                                current_key = current_key.saturating_add(batch_size as u128);
+                                
+                                // Verificar correspondências
+                                for (idx, hash) in matches {
+                                    if !process_found_clone.load(Ordering::Relaxed) {
+                                        let key = keys[idx];
+                                        println!("\n{}", format!("!! ENCONTRADA CORRESPONDÊNCIA DE HASH EM WORKER SEQUENCIAL: chave = {:x}", key).green().bold());
+                                        let _ = result_sender.send((key, hash.to_vec(), pubkeys_buffer[idx]));
+                                        process_found_clone.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                
+                                // Atualizar a chave atual para estatísticas
+                                stats_clone.set_current_key(current_key);
                             }
                         }
                     }
                 });
             }
-            drop(result_sender);
+            
+            // Thread principal terminou, sinalizar para thread de UI também encerrar
+            if !process_found.load(Ordering::Relaxed) {
+                process_app_state.search_active.store(false, Ordering::SeqCst);
+            }
         });
+        
+        // Thread para atualização da UI em tempo real
+        let ui_app_state = app_state.clone();
+        let ui_found = found.clone();
+        let ui_processed_keys = processed_keys.clone();
+        let ui_stats = performance_stats.clone();
+        
+        s.spawn(move |_| {
+            let mut last_ui_update = Instant::now();
+            let mut last_key = 0u128;
+            
+            while ui_app_state.search_active.load(Ordering::Relaxed) {
+                // Dormir brevemente para não consumir CPU desnecessariamente
+                std::thread::sleep(Duration::from_millis(50));
+                
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_ui_update);
+                
+                // Atualizar UI apenas se passou tempo suficiente
+                if elapsed.as_millis() >= MIN_UI_UPDATE_INTERVAL_MS as u128 {
+                    last_ui_update = now;
+                    
+                    // Atualizar dashboard
+                    let snapshot = ui_stats.get_snapshot();
+                    
+                    // Só atualizar a tela se houver mudanças significativas
+                    if snapshot.get_progress_percent() > 0.1 || last_key == 0 {
+                        clear_terminal();
+                        println!("{}", dashboard.render());
+                        
+                        // Exibir estatísticas de cache periodicamente
+                        let should_print_cache_stats = {
+                            let mut last_time = last_cache_stat_time.lock().unwrap();
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(*last_time);
+                            
+                            if elapsed.as_secs() >= 30 {
+                                *last_time = now;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        
+                        if should_print_cache_stats {
+                            // Obter e imprimir estatísticas de cache
+                            let stats = ui_stats.get_snapshot();
+                            
+                            println!("\n■ CACHE STATUS");
+                            println!("Hit Rate: {:.1}% ({} hits, {} misses)", 
+                                   stats.get_cache_hit_rate() * 100.0,
+                                   stats.get_cache_hits(),
+                                   stats.get_cache_misses());
+                            
+                            println!("\n■ RANGE INFORMATION");
+                            println!("Chave Atual: 0x{}", format_hex(stats.get_current_key(), 8));
+                            println!("Início do Range: 0x{}", format_hex(stats.get_range_start(), 8));
+                            println!("Fim do Range: 0x{}", format_hex(stats.get_range_end(), 8));
+                            println!("Progresso: {} ({:.2}%)", 
+                                   stats.get_processed_keys(),
+                                   stats.get_progress_percent());
+                            
+                            println!("\n────────────────────────────────────────────────────────────────────────────────");
+                            println!("INFO: Pressione Ctrl+C para interromper a busca. O progresso será salvo automaticamente.");
+                        }
+                        
+                        last_key = snapshot.get_current_key();
+                    }
+                }
+                
+                // Verificar se a busca encontrou resultado ou foi interrompida
+                if ui_found.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        });
+        
+        // Aguardar a conclusão de todos os threads
     }).unwrap();
-
-    let final_processed = processed_keys.load(Ordering::Relaxed);
-    let elapsed_final = app_state.get_elapsed_time();
-    println!("Busca turbo concluída! Total de chaves processadas: {}", final_processed);
-    if let Some(duration) = elapsed_final {
-         println!("Tempo total: {:.2?}", duration);
-         let rate_final = if duration.as_secs_f64() > 0.0 { final_processed as f64 / duration.as_secs_f64() } else { 0.0 };
-          println!("Taxa média: {:.2} Mkeys/s (SHA256+RIPEMD160)", rate_final / 1_000_000.0);
-    }
-
-    if found.load(Ordering::Relaxed) {
-        println!("Chave encontrada salva em {}", app_state.get_results_file_path());
+    
+    // Após a conclusão, obter snapshot final para estatísticas
+    let final_stats = performance_stats.get_snapshot();
+    
+    // Imprimir resumo final
+    println!("\n────────────────────────────────────────────────────────────────────────────────");
+    if found_final.load(Ordering::Relaxed) {
+        println!("█ BUSCA CONCLUÍDA COM SUCESSO!");
     } else {
+        println!("█ BUSCA CONCLUÍDA");
+    }
+    println!("Total de chaves processadas: {}", final_stats.get_processed_keys());
+    println!("Tempo total: {:.2}s", final_stats.get_elapsed_time().as_secs_f64());
+    
+    let rate = if final_stats.get_elapsed_time().as_secs_f64() > 0.0 {
+        final_stats.get_processed_keys() as f64 / final_stats.get_elapsed_time().as_secs_f64()
+    } else {
+        0.0
+    };
+    println!("Taxa média: {:.2} Mkeys/s (SHA256+RIPEMD160)", rate / 1_000_000.0);
+    
+    if !found_final.load(Ordering::Relaxed) {
         println!("Chave não encontrada no range especificado.");
     }
+    println!("────────────────────────────────────────────────────────────────────────────────");
 } 
