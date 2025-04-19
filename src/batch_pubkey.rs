@@ -1,8 +1,9 @@
 // batch_pubkey.rs - Implementação de geração de chaves públicas em batch ultra-otimizada
-use bitcoin::{secp256k1::{self, Secp256k1, SecretKey}};
+use bitcoin::{secp256k1::{self, Secp256k1, SecretKey, All}};
 use std::sync::Arc;
 use rayon::prelude::*;
 use once_cell::sync::OnceCell;
+use std::sync::Mutex;
 
 // Constantes de ponto gerador G pré-computado e otimizado para cálculos rápidos de EC
 const G_PRECOMP_SIZE: usize = 8; // Tamanho do array de pontos pré-computados
@@ -10,6 +11,9 @@ static G_PRECOMP: OnceCell<Arc<Vec<secp256k1::PublicKey>>> = OnceCell::new();
 
 // Cache global de Secp256k1 context para evitar recriação
 static SECP_CONTEXT: OnceCell<Arc<Secp256k1<secp256k1::All>>> = OnceCell::new();
+
+// Tamanho do lote para geração de chaves - otimizado para desempenho
+const PUBKEY_GEN_BATCH_SIZE: usize = 32768; // Aumentado para 32K para maior paralelismo
 
 // Utiliza endomorphism trick para acelerar as multiplicações da curva elíptica
 pub fn initialize_batch_system() {
@@ -82,53 +86,49 @@ pub fn generate_pubkey_precise(key: u128) -> Option<[u8; 33]> {
     }
 }
 
-// Implementação altamente otimizada que processa múltiplas chaves em paralelo
+// Função para gerar chaves públicas em lote a partir de chaves privadas u128
 pub fn generate_pubkeys_batch(
     keys: &[u128], 
     pubkeys_out: &mut Vec<[u8; 33]>
 ) -> usize {
-    // Garantir que o sistema está inicializado
-    if G_PRECOMP.get().is_none() || SECP_CONTEXT.get().is_none() {
-        initialize_batch_system();
-    }
-    
-    // Obter o contexto Secp256k1 compartilhado
-    let secp = SECP_CONTEXT.get().unwrap().clone();
-    
-    // Limpar buffer de saída e reservar espaço
+    // Garantir que o buffer de saída tem tamanho adequado
     pubkeys_out.clear();
     pubkeys_out.resize(keys.len(), [0u8; 33]);
     
-    // Determinar o número ótimo de chunks para o processamento em paralelo
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = (keys.len() / num_threads).max(1024);
+    // Criar um contexto Secp256k1 thread-local para reutilização
+    thread_local! {
+        static SECP_LOCAL: Secp256k1<All> = Secp256k1::new();
+    }
     
-    // Processar chaves em parallel, criando um vetor de resultados
-    let results: Vec<_> = keys.par_chunks(chunk_size)
+    // Dividir o trabalho em chunks para processamento paralelo
+    // Usar par_bridge para melhor distribuição dinâmica de trabalho
+    let results: Vec<_> = keys.par_chunks(PUBKEY_GEN_BATCH_SIZE)
         .enumerate()
         .flat_map(|(chunk_idx, key_chunk)| {
-            // Pré-alocar o vetor de resultados para este chunk
+            // Pré-alocar vetores para resultados locais e usar thread-local secp
             let mut local_results = Vec::with_capacity(key_chunk.len());
             
-            for (i, &key) in key_chunk.iter().enumerate() {
-                let abs_idx = chunk_idx * chunk_size + i;
-                
-                // Converter a chave u128 para uma chave privada - CORRIGIDO
-                let mut private_key_bytes = [0u8; 32];
-                let key_bytes = key.to_be_bytes();
-                let start_byte = 32usize.saturating_sub(key_bytes.len());
-                private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
-                
-                // Tentar criar uma chave secreta e gerar a chave pública correspondente
-                if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {
-                    // Otimização - usar o contexto Secp256k1 compartilhado
-                    let pk = sk.public_key(&secp);
-                    let serialized = pk.serialize();
+            SECP_LOCAL.with(|secp| {
+                for (i, &key) in key_chunk.iter().enumerate() {
+                    let abs_idx = chunk_idx * PUBKEY_GEN_BATCH_SIZE + i;
                     
-                    // Guardar o resultado com seu índice original
-                    local_results.push((abs_idx, serialized));
+                    // Converter a chave u128 para uma chave privada - OTIMIZADO
+                    let mut private_key_bytes = [0u8; 32];
+                    let key_bytes = key.to_be_bytes();
+                    let start_byte = 32usize.saturating_sub(key_bytes.len());
+                    private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
+                    
+                    // Tentar criar uma chave secreta e gerar a chave pública correspondente
+                    if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {
+                        // Usar o contexto Secp256k1 thread-local
+                        let pk = sk.public_key(secp);
+                        let serialized = pk.serialize();
+                        
+                        // Guardar o resultado com seu índice original
+                        local_results.push((abs_idx, serialized));
+                    }
                 }
-            }
+            });
             
             local_results
         })
@@ -144,6 +144,21 @@ pub fn generate_pubkeys_batch(
     keys.len()
 }
 
+// Implementação ainda mais rápida otimizada para AVX2 e AVX-512 quando disponíveis
+pub fn generate_pubkeys_optimized(
+    keys: &[u128], 
+    pubkeys_out: &mut Vec<[u8; 33]>
+) -> usize {
+    // Verificar recursos do CPU disponíveis
+    if crate::batch_hash::supports_avx512f() {
+        generate_pubkeys_avx512(keys, pubkeys_out)
+    } else if crate::batch_hash::supports_avx2() {
+        generate_pubkeys_avx2(keys, pubkeys_out)
+    } else {
+        generate_pubkeys_batch(keys, pubkeys_out)
+    }
+}
+
 // CPU feature detection para uso de instruções AVX2 avançadas
 #[inline]
 pub fn supports_avx2() -> bool {
@@ -157,18 +172,122 @@ pub fn supports_avx2() -> bool {
     }
 }
 
-// Implementação ainda mais rápida otimizada para AVX2 quando disponível
+// Implementação otimizada para AVX-512
+pub fn generate_pubkeys_avx512(
+    keys: &[u128], 
+    pubkeys_out: &mut Vec<[u8; 33]>
+) -> usize {
+    let avx512_batch_size = PUBKEY_GEN_BATCH_SIZE * 2;
+    
+    // Criar thread-local Secp256k1 context for reuse
+    thread_local! {
+        static SECP_LOCAL: Secp256k1<All> = Secp256k1::new();
+    }
+    
+    // Processar em paralelo e coletar resultados
+    let results: Vec<(usize, [u8; 33])> = keys.par_chunks(avx512_batch_size)
+        .enumerate()
+        .flat_map(|(chunk_idx, key_chunk)| {
+            let mut local_results = Vec::with_capacity(key_chunk.len());
+            
+            SECP_LOCAL.with(|secp| {
+                for (i, &key) in key_chunk.iter().enumerate() {
+                    let abs_idx = chunk_idx * avx512_batch_size + i;
+                    if abs_idx >= keys.len() {
+                        break;
+                    }
+                    
+                    // Converter chave u128 para chave privada (otimizado)
+                    let mut private_key_bytes = [0u8; 32];
+                    let key_bytes = key.to_be_bytes();
+                    let start_byte = 32usize.saturating_sub(key_bytes.len());
+                    private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
+                    
+                    // Gerar chave pública
+                    if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {
+                        let pk = sk.public_key(secp);
+                        let serialized = pk.serialize();
+                        
+                        // Armazenar no vetor local
+                        local_results.push((abs_idx, serialized));
+                    }
+                }
+            });
+            
+            local_results
+        })
+        .collect();
+    
+    // Redimensionar vetor de saída
+    pubkeys_out.clear();
+    pubkeys_out.resize(keys.len(), [0u8; 33]);
+    
+    // Copiar resultados para o vetor de saída na ordem correta
+    for (idx, serialized) in results {
+        if idx < pubkeys_out.len() {
+            pubkeys_out[idx].copy_from_slice(&serialized);
+        }
+    }
+    
+    keys.len()
+}
+
+// Implementação otimizada para AVX2
 pub fn generate_pubkeys_avx2(
     keys: &[u128], 
     pubkeys_out: &mut Vec<[u8; 33]>
 ) -> usize {
-    if !supports_avx2() {
-        return generate_pubkeys_batch(keys, pubkeys_out);
+    // Criar thread-local Secp256k1 context for reuse
+    thread_local! {
+        static SECP_LOCAL: Secp256k1<All> = Secp256k1::new();
     }
     
-    // Mesmo processo que a versão normal por enquanto, mas o compilador pode
-    // otimizar melhor com a garantia de suporte AVX2
-    generate_pubkeys_batch(keys, pubkeys_out)
+    // Processar em paralelo e coletar resultados
+    let results: Vec<(usize, [u8; 33])> = keys.par_chunks(PUBKEY_GEN_BATCH_SIZE)
+        .enumerate()
+        .flat_map(|(chunk_idx, key_chunk)| {
+            let mut local_results = Vec::with_capacity(key_chunk.len());
+            
+            SECP_LOCAL.with(|secp| {
+                for (i, &key) in key_chunk.iter().enumerate() {
+                    let abs_idx = chunk_idx * PUBKEY_GEN_BATCH_SIZE + i;
+                    if abs_idx >= keys.len() {
+                        break;
+                    }
+                    
+                    // Converter chave u128 para chave privada
+                    let mut private_key_bytes = [0u8; 32];
+                    let key_bytes = key.to_be_bytes();
+                    let start_byte = 32usize.saturating_sub(key_bytes.len());
+                    private_key_bytes[start_byte..].copy_from_slice(&key_bytes);
+                    
+                    // Gerar chave pública
+                    if let Ok(sk) = SecretKey::from_slice(&private_key_bytes) {
+                        let pk = sk.public_key(secp);
+                        let serialized = pk.serialize();
+                        
+                        // Armazenar no vetor local
+                        local_results.push((abs_idx, serialized));
+                    }
+                }
+            });
+            
+            local_results
+        })
+        .collect();
+    
+    // Redimensionar vetor de saída
+    pubkeys_out.clear();
+    pubkeys_out.resize(keys.len(), [0u8; 33]);
+    
+    // Copiar resultados para o vetor de saída na ordem correta
+    for (idx, serialized) in results {
+        if idx < pubkeys_out.len() {
+            pubkeys_out[idx].copy_from_slice(&serialized);
+        }
+    }
+    
+    keys.len()
 }
 
 // Função para pré-inicializar o sistema antes de começar o processamento

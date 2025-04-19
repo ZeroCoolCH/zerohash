@@ -1,6 +1,6 @@
 // turbo_search.rs - Implementação de busca de alta performance capaz de processar milhões de chaves/s
 use crate::app_state::AppState;
-use crate::batch_pubkey::{generate_pubkeys_batch, generate_pubkey_precise, warmup_system};
+use crate::batch_pubkey::{generate_pubkeys_batch, generate_pubkey_precise, warmup_system, generate_pubkeys_optimized};
 use crate::batch_hash::{
     hash160_and_match_direct, 
     warm_up_cache, 
@@ -31,11 +31,11 @@ use colored::*;
 use std::fmt;
 
 // Otimizações de batch size para melhor performance
-const MEGA_BATCH_SIZE: usize = 65536;  // Reduzido para 64K para menor uso de memória
-const SUB_BATCH_SIZE: usize = 16384;    // Reduzido para 16K para melhor utilização de CPU e memória
-const CHANNEL_BUFFER: usize = 64;       // Aumentado para pipeline mais eficiente
-const TURBO_BATCH_SIZE: usize = 32768;  // Reduzido para 32K para balancear throughput
-const DYNAMIC_CHUNK_SIZE: usize = 65536; // Reduzido para 64K para melhor balanceamento em ranges grandes
+const MEGA_BATCH_SIZE: usize = 131072;  // Aumentado para 128K para maior throughput
+const SUB_BATCH_SIZE: usize = 32768;    // Aumentado para 32K para melhor utilização de CPU e memória
+const CHANNEL_BUFFER: usize = 128;      // Aumentado para 128 para pipeline mais eficiente
+const TURBO_BATCH_SIZE: usize = 65536;  // Aumentado para 64K para máximo throughput
+const DYNAMIC_CHUNK_SIZE: usize = 131072; // Aumentado para 128K para melhor balanceamento em ranges grandes
 
 // Constantes para controle de exibição e UI
 const MIN_UI_UPDATE_INTERVAL_MS: u64 = 100;  // Intervalo mínimo entre atualizações da UI
@@ -378,7 +378,7 @@ pub fn load_progress(progress_path: &str) -> Result<u128, String> {
 }
 
 /// Salva o progresso atual da busca em um arquivo JSON.
-pub fn save_progress(progress_path: &str, current_key: u128) -> std::io::Result<()> {
+pub fn save_progress(_progress_path: &str, current_key: u128) -> std::io::Result<()> {
     // Se o AppState estiver disponível, salvar no formato JSON
     if let Some(app_state) = crate::app_state::get_current_app_state() {
         let range_start = match app_state.range_start.lock() {
@@ -449,7 +449,9 @@ fn initialize_contextual_cache() {
     
     // Verificar e informar o suporte a instruções avançadas
     let has_avx2 = cache_manager.has_advanced_instruction_support();
+    let has_avx512 = crate::batch_hash::supports_avx512f();
     println!("Suporte a instruções AVX2: {}", if has_avx2 { "Sim ✓" } else { "Não ✗" });
+    println!("Suporte a instruções AVX-512: {}", if has_avx512 { "Sim ✓" } else { "Não ✗" });
     
     // Informar sobre o paralelismo recomendado
     let recommended_threads = cache_manager.recommended_parallelism();
@@ -693,8 +695,8 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                                 }
                             }
                         } else {
-                            // Método normal batch
-                            generate_pubkeys_batch(&keys, &mut pubkeys_buffer);
+                            // Método normal batch - usar versão otimizada para AVX-512/AVX2
+                            generate_pubkeys_optimized(&keys, &mut pubkeys_buffer);
                         }
                         
                         let matches = hash160_and_match_direct(&pubkeys_buffer, &target_hash);
@@ -900,7 +902,7 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                                         }
                                     }
                                 } else {
-                                    generate_pubkeys_batch(&keys, &mut pubkeys_buffer);
+                                    generate_pubkeys_optimized(&keys, &mut pubkeys_buffer);
                                 }
                                 
                                 // Verificar correspondências

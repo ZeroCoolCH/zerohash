@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::fmt;
 use std::collections::VecDeque;
-use parking_lot::RwLock;
+use parking_lot::Mutex as PLMutex;
 use colored::*;
 
 // Tamanho do histórico de medições para cálculo de média móvel

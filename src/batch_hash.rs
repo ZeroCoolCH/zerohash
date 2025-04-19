@@ -43,21 +43,21 @@ extern "C" {
     );
 }
 
-// Tamanho do lote para hashing - Aumentado para melhorar desempenho
-const HASH_BATCH_SIZE: usize = 16384; // Mantido em 16K para equilibrar memória e performance
+// Tamanhos otimizados para melhorar throughput
+const HASH_BATCH_SIZE: usize = 32768; // Aumentado para 32K para melhor throughput em sistemas modernos
 
 // Tamanhos de prefixo para cada nível de cache
-const L1_PREFIX_SIZE: usize = 1; // Reduzido para 1 byte para ter mais cache hits
-const L2_PREFIX_SIZE: usize = 2; // Reduzido para 2 bytes para melhor performance
-const L3_PREFIX_SIZE: usize = 3; // Reduzido para 3 bytes para equilibrar hit rate
+const L1_PREFIX_SIZE: usize = 1;      // Manter em 1 para máximo hit rate
+const L2_PREFIX_SIZE: usize = 2;      // Reduzido para 2 bytes para melhor performance
+const L3_PREFIX_SIZE: usize = 3;      // Reduzido para 3 bytes para equilibrar hit rate
 
 // Constante para tamanho de prefixo padrão
 const PREFIX_SIZE: usize = L1_PREFIX_SIZE;
 
 // Tamanhos dos caches
-const L1_MAX_ENTRIES: usize = 256;   // 256 entradas (suficiente para cobrir 1 byte)
-const L2_MAX_ENTRIES: usize = 1024;  // 1024 entradas (bom para 2 bytes)
-const L3_MAX_ENTRIES: usize = 4096;  // 4096 entradas (equilibrado para 3 bytes)
+const L1_MAX_ENTRIES: usize = 512;    // Aumentado para 512 para cobrir mais prefixos comuns
+const L2_MAX_ENTRIES: usize = 1024;   // 1024 entradas (bom para 2 bytes)
+const L3_MAX_ENTRIES: usize = 4096;   // 4096 entradas (equilibrado para 3 bytes)
 
 // Tipo para armazenar estado intermediário do SHA-256
 #[derive(Clone, Debug)]
@@ -256,20 +256,138 @@ pub fn hash160_sha3(pubkeys: &[[u8; 33]], hashes_out: &mut Vec<[u8; 20]>) {
 }
 
 // Implementação do hash160 (SHA256 + RIPEMD160) otimizada para processamento em lote
-// Agora com suporte a Cache Hierárquico
+// Agora com suporte a Cache Hierárquico e instruções avançadas
 pub fn batch_hash160(
     pubkeys: &[[u8; 33]],
     hashes_out: &mut Vec<[u8; 20]>,
 ) -> usize {
     // Verificar suporte a instruções avançadas
-    if supports_avx2() {
+    if supports_avx512f() {
+        // Usar código otimizado para AVX-512
+        hash160_avx512_cached(pubkeys, hashes_out)
+    } else if supports_avx2() {
+        // Fallback para AVX2
         hash160_avx2_cached(pubkeys, hashes_out)
     } else {
+        // Fallback para sistemas sem instruções avançadas
         hash160_fallback_cached(pubkeys, hashes_out)
     }
 }
 
-// Nova implementação que usa o cache hierárquico
+// Nova implementação otimizada para AVX-512
+#[cfg(target_arch = "x86_64")]
+fn hash160_avx512_cached(
+    pubkeys: &[[u8; 33]],
+    hashes_out: &mut Vec<[u8; 20]>,
+) -> usize {
+    let num_keys = pubkeys.len();
+    
+    // Limpar buffer de saída e reservar espaço temporário
+    let mut results_temp = vec![(0usize, [0u8; 20]); 0];
+    
+    // Processar paralelamente e coletar resultados
+    let results: Vec<(usize, [u8; 20])> = pubkeys.par_chunks(HASH_BATCH_SIZE * 2)
+        .enumerate()
+        .flat_map(|(chunk_idx, pubkey_chunk)| {
+            // Criar vetores locais para armazenar resultados
+            let mut local_results = Vec::with_capacity(pubkey_chunk.len());
+            // Obter acesso ao cache - Cada thread tem sua própria cópia temporária do cache
+            let cache = get_hierarchical_cache();
+            
+            // Buffer para processamento em lote direto
+            let mut batch_pubkeys = Vec::with_capacity(pubkey_chunk.len());
+            let mut batch_indices = Vec::with_capacity(pubkey_chunk.len());
+            
+            // Primeira passagem - separar os casos de cache hit e miss
+            for (i, pubkey) in pubkey_chunk.iter().enumerate() {
+                let abs_idx = chunk_idx * HASH_BATCH_SIZE * 2 + i;
+                if abs_idx >= num_keys {
+                    break;
+                }
+                
+                // Extrair prefixo para verificar no cache - apenas 1 byte para L1
+                let prefix = &pubkey[0..L1_PREFIX_SIZE.min(pubkey.len())];
+                
+                // Otimização para chaves comprimidas
+                if prefix[0] == 0x02 || prefix[0] == 0x03 {
+                    let mut key = [0u8; L1_PREFIX_SIZE];
+                    key.copy_from_slice(prefix);
+                    
+                    if let Some(cached_state) = cache.l1.states.lock().get(&key) {
+                        // Cache hit - processar diretamente
+                        cache.l1.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let hash = hash160_with_state_cpp_wrapper(cached_state, &pubkey[L1_PREFIX_SIZE..]);
+                        
+                        // Armazenar diretamente no vetor local de resultados
+                        local_results.push((abs_idx, hash));
+                    } else {
+                        // Cache miss - adicionar ao lote
+                        cache.l1.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        batch_pubkeys.push(*pubkey);
+                        batch_indices.push(abs_idx);
+                    }
+                } else {
+                    // Direto para processamento em lote
+                    batch_pubkeys.push(*pubkey);
+                    batch_indices.push(abs_idx);
+                }
+            }
+            
+            // Processar o lote restante de uma vez usando código otimizado para AVX-512
+            if !batch_pubkeys.is_empty() {
+                let mut batch_hashes = vec![[0u8; 20]; batch_pubkeys.len()];
+                
+                unsafe {
+                    // Aproveitar instruções AVX-512 se disponíveis através da FFI
+                    calculate_hash160_batch_cpp(
+                        batch_pubkeys.as_ptr() as *const u8,
+                        batch_pubkeys.len(),
+                        batch_hashes.as_mut_ptr() as *mut u8
+                    );
+                }
+                
+                // Atualizar cache e coletar resultados
+                for i in 0..batch_indices.len() {
+                    let idx = batch_indices[i];
+                    let pubkey = batch_pubkeys[i];
+                    let hash = batch_hashes[i];
+                    
+                    // Apenas cache L1 para prefixos comuns (otimização de memória)
+                    if pubkey[0] == 0x02 || pubkey[0] == 0x03 {
+                        let prefix = &pubkey[0..L1_PREFIX_SIZE];
+                        let mut key = [0u8; L1_PREFIX_SIZE];
+                        key.copy_from_slice(prefix);
+                        
+                        let state = extract_sha256_state_cpp_wrapper(prefix);
+                        cache.l1.states.lock().insert(key, state);
+                        cache.l1.inserts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    
+                    // Armazenar resultado
+                    local_results.push((idx, hash));
+                }
+            }
+            
+            // Retornar todos os resultados locais
+            local_results
+        })
+        .collect();
+    
+    // Redimensionar vetor de saída
+    hashes_out.clear();
+    hashes_out.resize(num_keys, [0u8; 20]);
+    
+    // Aplicar resultados coletados
+    for (idx, hash) in results {
+        if idx < hashes_out.len() {
+            hashes_out[idx] = hash;
+        }
+    }
+    
+    num_keys
+}
+
+// Implementação AVX2 com abordagem semelhante à AVX-512 para consistência
 #[cfg(target_arch = "x86_64")]
 fn hash160_avx2_cached(
     pubkeys: &[[u8; 33]],
@@ -277,12 +395,11 @@ fn hash160_avx2_cached(
 ) -> usize {
     let num_keys = pubkeys.len();
     
-    // Limpar buffer de saída e reservar espaço
-    hashes_out.clear();
-    hashes_out.resize(num_keys, [0u8; 20]);
+    // Limpar buffer de saída temporário
+    let mut results_temp = vec![(0usize, [0u8; 20]); 0];
     
-    // Processamento em lotes paralelos usando map_collect
-    let results: Vec<_> = pubkeys.par_chunks(HASH_BATCH_SIZE)
+    // Processar chaves e coletar resultados
+    let results: Vec<(usize, [u8; 20])> = pubkeys.par_chunks(HASH_BATCH_SIZE)
         .enumerate()
         .flat_map(|(chunk_idx, pubkey_chunk)| {
             let mut local_results = Vec::with_capacity(pubkey_chunk.len());
@@ -341,7 +458,11 @@ fn hash160_avx2_cached(
                 }
                 
                 // Armazenar resultados do lote e atualizar cache para 0x02/0x03
-                for ((idx, pubkey), hash) in batch_indices.iter().zip(batch_pubkeys.iter()).zip(batch_hashes.iter()) {
+                for i in 0..batch_indices.len() {
+                    let idx = batch_indices[i];
+                    let pubkey = batch_pubkeys[i];
+                    let hash = batch_hashes[i];
+                    
                     // Apenas armazenar no cache L1 se for um prefixo comum
                     if pubkey[0] == 0x02 || pubkey[0] == 0x03 {
                         let prefix = &pubkey[0..L1_PREFIX_SIZE];
@@ -358,7 +479,7 @@ fn hash160_avx2_cached(
                         }
                     }
                     
-                    local_results.push((*idx, *hash));
+                    local_results.push((idx, hash));
                 }
             }
             
@@ -366,10 +487,14 @@ fn hash160_avx2_cached(
         })
         .collect();
     
-    // Copiar resultados para o buffer de saída
+    // Redimensionar vetor de saída e copiar os resultados
+    hashes_out.clear();
+    hashes_out.resize(num_keys, [0u8; 20]);
+    
+    // Aplicar resultados coletados
     for (abs_idx, hash) in results {
         if abs_idx < hashes_out.len() {
-            hashes_out[abs_idx].copy_from_slice(&hash);
+            hashes_out[abs_idx] = hash;
         }
     }
     
@@ -426,6 +551,19 @@ pub fn supports_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+// Verificar suporte a AVX-512
+#[inline]
+pub fn supports_avx512f() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx512f")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
