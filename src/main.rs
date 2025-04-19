@@ -371,6 +371,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     let app_state = Arc::new(AppState::new(target_address));
     
+    // Definir como AppState atual para acesso global
+    AppState::set_as_current(app_state.clone());
+    
     // Atualizar o hash160 do target
     {
         let mut target_hash = app_state.target_pubkey_hash.lock().unwrap();

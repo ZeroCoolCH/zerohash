@@ -31,14 +31,14 @@ use colored::*;
 use std::fmt;
 
 // Otimizações de batch size para melhor performance
-const MEGA_BATCH_SIZE: usize = 131072;  // Aumentado para 128K - Manter tamanho grande para processamento eficiente
-const SUB_BATCH_SIZE: usize = 32768;    // Aumentado para 32K - Melhor utilização de CPU e memória
-const CHANNEL_BUFFER: usize = 32;       // Aumentado para pipeline mais eficiente
-const TURBO_BATCH_SIZE: usize = 65536;  // Aumentado para 64K - Maximizar throughput
-const DYNAMIC_CHUNK_SIZE: usize = 131072; // Aumentado para 128K - Melhor balanceamento para ranges grandes
+const MEGA_BATCH_SIZE: usize = 65536;  // Reduzido para 64K para menor uso de memória
+const SUB_BATCH_SIZE: usize = 16384;    // Reduzido para 16K para melhor utilização de CPU e memória
+const CHANNEL_BUFFER: usize = 64;       // Aumentado para pipeline mais eficiente
+const TURBO_BATCH_SIZE: usize = 32768;  // Reduzido para 32K para balancear throughput
+const DYNAMIC_CHUNK_SIZE: usize = 65536; // Reduzido para 64K para melhor balanceamento em ranges grandes
 
 // Constantes para controle de exibição e UI
-const MIN_UI_UPDATE_INTERVAL_MS: u64 = 200;  // Intervalo mínimo entre atualizações da UI
+const MIN_UI_UPDATE_INTERVAL_MS: u64 = 100;  // Intervalo mínimo entre atualizações da UI
 const PROGRESS_SAVE_INTERVAL_MS: u64 = 3000; // Salvar progresso a cada 3 segundos
 
 // Definir constante para o arquivo de progresso
@@ -231,18 +231,26 @@ fn save_progress_json(address: &str, range_start: u128, range_end: u128, current
     }
     
     // Salvar arquivo JSON
+    println!("Tentando criar arquivo JSON: {}", JSON_PROGRESS_FILE);
     match File::create(JSON_PROGRESS_FILE) {
         Ok(file) => {
+            println!("Arquivo JSON criado com sucesso, serializando dados...");
             match serde_json::to_writer_pretty(file, &progress_data) {
                 Ok(_) => {
                     println!("✓ Progresso JSON salvo com sucesso para endereço {} e range {:x}-{:x}", 
                              address, range_start, range_end);
                     Ok(())
                 },
-                Err(e) => Err(format!("Falha ao serializar JSON: {}", e))
+                Err(e) => {
+                    println!("Erro ao serializar JSON: {}", e);
+                    Err(format!("Falha ao serializar JSON: {}", e))
+                }
             }
         },
-        Err(e) => Err(format!("Falha ao criar arquivo JSON: {}", e))
+        Err(e) => {
+            println!("Erro ao criar arquivo JSON: {}", e);
+            Err(format!("Falha ao criar arquivo: {}", e))
+        }
     }
 }
 
@@ -369,14 +377,9 @@ pub fn load_progress(progress_path: &str) -> Result<u128, String> {
     }
 }
 
-/// Salva o progresso atual da busca em um arquivo (para compatibilidade e no novo formato JSON).
+/// Salva o progresso atual da busca em um arquivo JSON.
 pub fn save_progress(progress_path: &str, current_key: u128) -> std::io::Result<()> {
-    // Salvar no formato antigo para compatibilidade
-    let mut file = File::create(progress_path)?;
-    let hex_string = format!("{:x}", current_key);
-    write!(file, "{}", hex_string)?;
-    
-    // Se o AppState estiver disponível, salvar também no formato JSON
+    // Se o AppState estiver disponível, salvar no formato JSON
     if let Some(app_state) = crate::app_state::get_current_app_state() {
         let range_start = match app_state.range_start.lock() {
             Ok(guard) => *guard,
@@ -388,12 +391,20 @@ pub fn save_progress(progress_path: &str, current_key: u128) -> std::io::Result<
             Err(_) => u128::MAX,
         };
         
-        let _ = save_progress_json(
+        let result = save_progress_json(
             &app_state.target_address,
             range_start,
             range_end,
             current_key
         );
+        
+        if result.is_err() {
+            eprintln!("Erro ao salvar progresso em JSON: {:?}", result.err());
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Falha ao salvar progresso em JSON"));
+        }
+    } else {
+        eprintln!("AppState não disponível para salvar progresso.");
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "AppState não disponível"));
     }
     
     Ok(())
@@ -463,7 +474,7 @@ pub fn turbo_search(app_state: Arc<AppState>) {
     
     // Ajustar ponto de início efetivo baseado no progresso anterior
     let effective_range_start = if app_state.should_resume() && !is_random_mode {
-        if let Ok(last_key) = load_progress(&progress_path) {
+        if let Ok(last_key) = load_specific_progress(&app_state.target_address, range_start, range_end) {
             if last_key >= range_start && last_key < range_end {
                 let next_key = last_key.saturating_add(1);
                 println!("Retomando busca a partir da chave {:x}", next_key);
@@ -750,14 +761,30 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                     // Para ranges extremamente grandes, criar apenas um número limitado de chunks
                     println!("Range muito grande detectado ({} valores). Usando abordagem otimizada.", main_range.size());
                     
-                    // Criar chunks iniciais (4 por thread)
-                    let initial_chunks_per_thread = 4;
+                    // Criar chunks iniciais (1 por thread) com tamanho limitado
+                    let initial_chunks_per_thread = 1; // Reduzido para 1 por thread
                     let initial_chunks_count = num_threads * initial_chunks_per_thread;
                     
-                    println!("Criando {} chunks iniciais ({} por thread)", initial_chunks_count, initial_chunks_per_thread);
+                    // Limitar o tamanho máximo de cada chunk para evitar alocações excessivas
+                    const MAX_CHUNK_SIZE: u128 = 1_000_000_000_000; // 1 trilhão de chaves por chunk
+                    println!("Criando {} chunks iniciais ({} por thread) com tamanho máximo de {} chaves", initial_chunks_count, initial_chunks_per_thread, MAX_CHUNK_SIZE);
                     
-                    // Usar o método split_into para criar chunks de tamanho uniforme
-                    main_range.split_into(initial_chunks_count)
+                    // Usar o método split_into para criar chunks de tamanho uniforme, mas limitar o tamanho
+                    let mut limited_chunks = Vec::new();
+                    let total_range_size = main_range.size();
+                    let chunk_size = (total_range_size / initial_chunks_count as u128).min(MAX_CHUNK_SIZE);
+                    let mut current_start = main_range.start;
+                    for _ in 0..initial_chunks_count {
+                        let current_end = (current_start + chunk_size - 1).min(main_range.end);
+                        if current_start <= current_end {
+                            limited_chunks.push(WorkRange::new(current_start, current_end));
+                        }
+                        current_start = current_end.saturating_add(1);
+                        if current_start > main_range.end {
+                            break;
+                        }
+                    }
+                    limited_chunks
                 } else {
                     // Para ranges normais, criar todos os chunks usando split_by_chunk_size
                     println!("Criando {} chunks usando método otimizado", num_chunks);
@@ -920,6 +947,8 @@ pub fn turbo_search(app_state: Arc<AppState>) {
         s.spawn(move |_| {
             let mut last_ui_update = Instant::now();
             let mut last_key = 0u128;
+            let mut last_save_time = Instant::now();
+            let save_interval = Duration::from_millis(1000); // Salvar a cada 1 segundo
             
             while ui_app_state.search_active.load(Ordering::Relaxed) {
                 // Dormir brevemente para não consumir CPU desnecessariamente
@@ -927,57 +956,32 @@ pub fn turbo_search(app_state: Arc<AppState>) {
                 
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_ui_update);
+                let elapsed_since_save = now.duration_since(last_save_time);
                 
                 // Atualizar UI apenas se passou tempo suficiente
-                if elapsed.as_millis() >= MIN_UI_UPDATE_INTERVAL_MS as u128 {
+                if elapsed.as_millis() >= 100 {
                     last_ui_update = now;
                     
                     // Atualizar dashboard
                     let snapshot = ui_stats.get_snapshot();
                     
-                    // Só atualizar a tela se houver mudanças significativas
-                    if snapshot.get_progress_percent() > 0.1 || last_key == 0 {
-                        clear_terminal();
-                        println!("{}", dashboard.render());
-                        
-                        // Exibir estatísticas de cache periodicamente
-                        let should_print_cache_stats = {
-                            let mut last_time = last_cache_stat_time.lock().unwrap();
-                            let now = Instant::now();
-                            let elapsed = now.duration_since(*last_time);
-                            
-                            if elapsed.as_secs() >= 30 {
-                                *last_time = now;
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        
-                        if should_print_cache_stats {
-                            // Obter e imprimir estatísticas de cache
-                            let stats = ui_stats.get_snapshot();
-                            
-                            println!("\n■ CACHE STATUS");
-                            println!("Hit Rate: {:.1}% ({} hits, {} misses)", 
-                                   stats.get_cache_hit_rate() * 100.0,
-                                   stats.get_cache_hits(),
-                                   stats.get_cache_misses());
-                            
-                            println!("\n■ RANGE INFORMATION");
-                            println!("Chave Atual: 0x{}", format_hex(stats.get_current_key(), 8));
-                            println!("Início do Range: 0x{}", format_hex(stats.get_range_start(), 8));
-                            println!("Fim do Range: 0x{}", format_hex(stats.get_range_end(), 8));
-                            println!("Progresso: {} ({:.2}%)", 
-                                   stats.get_processed_keys(),
-                                   stats.get_progress_percent());
-                            
-                            println!("\n────────────────────────────────────────────────────────────────────────────────");
-                            println!("INFO: Pressione Ctrl+C para interromper a busca. O progresso será salvo automaticamente.");
-                        }
-                        
-                        last_key = snapshot.get_current_key();
+                    // Renderizar o dashboard completo a cada atualização
+                    clear_terminal();
+                    println!("{}", dashboard.render());
+                    
+                    // Exibir a chave atual em cada atualização
+                    println!("Chave atual: {:x}", snapshot.get_current_key());
+                    
+                    last_key = snapshot.get_current_key();
+                }
+                
+                // Salvar progresso periodicamente
+                if elapsed_since_save.as_millis() >= save_interval.as_millis() {
+                    let result = save_progress(JSON_PROGRESS_FILE, ui_stats.get_current_key());
+                    if result.is_err() {
+                        eprintln!("Erro ao salvar progresso: {:?}", result.err());
                     }
+                    last_save_time = now;
                 }
                 
                 // Verificar se a busca encontrou resultado ou foi interrompida

@@ -270,7 +270,12 @@ impl PerformanceStats {
         // Calcular ETA
         let eta = if average_rate > 0.0 && keys_remaining > 0 {
             let seconds_remaining = keys_remaining as f64 / average_rate;
-            Some(Duration::from_secs_f64(seconds_remaining))
+            // Verificar se o valor está dentro de um intervalo razoável para evitar pânico
+            if seconds_remaining.is_finite() && seconds_remaining >= 0.0 && seconds_remaining <= 1e9 {
+                Some(Duration::from_secs_f64(seconds_remaining))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -391,7 +396,7 @@ impl Dashboard {
         Self {
             stats,
             last_update: Instant::now(),
-            update_interval: Duration::from_millis(500),
+            update_interval: Duration::from_millis(100),
         }
     }
     
